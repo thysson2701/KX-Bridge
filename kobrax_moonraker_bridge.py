@@ -528,7 +528,7 @@ class KobraXBridge:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kobra X</title>
+<title>KX-Bridge</title>
 <style>
 :root{
   --bg:#1a1a1f;--card:#24242c;--raised:#2e2e3a;--border:#3a3a4a;
@@ -731,7 +731,7 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
 <body>
 
 <header>
-  <div class="logo">⬡ Kobra X</div>
+  <div class="logo">⬡ KX-Bridge</div>
   <div class="hname" id="h-pname">Anycubic Kobra X</div>
   <div class="hbadge" id="h-badge"><span class="dot"></span><span id="h-state">Standby</span></div>
   <button class="theme-btn" onclick="toggleTheme()">☀ / ☾</button>
@@ -1508,6 +1508,9 @@ function camStop(){
 }
 function toggleCam(){if(camOn)camStop();else camStart()}
 </script>
+<footer style="text-align:center;padding:12px;font-size:11px;color:var(--txt2);border-top:1px solid var(--border);margin-top:auto">
+  &copy; ViewIT 2026
+</footer>
 </body>
 </html>"""
         return web.Response(text=html, content_type="text/html",
