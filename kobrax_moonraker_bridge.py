@@ -1,0 +1,2067 @@
+"""
+kobrax_moonraker_bridge.py – Moonraker-kompatibler HTTP/WebSocket-Bridge für Anycubic Kobra X
+
+Emuliert die Moonraker/Klipper-API damit OrcaSlicer den Kobra X direkt ansteuern kann.
+
+Verwendung:
+  python kobrax_moonraker_bridge.py --printer-ip 192.168.178.94
+
+OrcaSlicer-Konfiguration:
+  Drucker-Typ: Klipper  |  Host: 127.0.0.1  |  Port: 7125
+"""
+
+import argparse
+import env_loader
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+import threading
+
+# kobrax_client aus dem selben Verzeichnis importieren
+sys.path.insert(0, os.path.dirname(__file__))
+from kobrax_client import KobraXClient
+
+try:
+    from aiohttp import web
+    import aiohttp
+except ImportError:
+    print("Fehler: aiohttp nicht installiert. Bitte: pip install aiohttp")
+    sys.exit(1)
+
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("bridge")
+
+KOBRA_TO_KLIPPER_STATE = {
+    "free":          "standby",
+    "busy":          "printing",
+    "printing":      "printing",
+    "preheating":    "printing",
+    "auto_leveling": "printing",
+    "checking":      "printing",
+    "updated":       "printing",
+    "init":          "printing",
+    "finished":      "complete",
+    "failed":        "error",
+    "canceled":      "standby",
+}
+
+MOONRAKER_VERSION = "v0.9.3-1"
+KLIPPER_VERSION   = "v0.12.0-1"
+
+
+class KobraXBridge:
+    def __init__(self, client: KobraXClient):
+        self.client = client
+        self.ws_clients: set[web.WebSocketResponse] = set()
+        self._last_state: dict = {}
+        self._state = {
+            "nozzle_temp":        0.0,
+            "nozzle_target":      0.0,
+            "bed_temp":           0.0,
+            "bed_target":         0.0,
+            "print_state":        "standby",
+            "filename":           "",
+            "progress":           0.0,
+            "print_duration":     0,
+            "curr_layer":         0,
+            "total_layers":       0,
+            "printer_name":       "Anycubic Kobra X",
+            "firmware_version":   "unknown",
+            "upload_url":         "",
+            "camera_url":         "",
+            "fan_speed":          0,
+            "light_on":           False,
+            "light_brightness":   80,
+        }
+        self._ams_slots: list[dict] = []
+        self._ams_loaded_slot: int = -1
+        self._last_uploaded_file: str = ""
+        self._serve_dir = tempfile.TemporaryDirectory(prefix="kobrax_serve_")
+        self._serve_dir_path: str = self._serve_dir.name
+
+        self._thumbnail_b64: str = ""  # base64-PNG aus file/report
+
+        # Register MQTT push callbacks
+        client.callbacks["tempature/report"]      = self._on_temp
+        client.callbacks["print/report"]          = self._on_print
+        client.callbacks["info/report"]           = self._on_info
+        client.callbacks["file/report"]           = self._on_file
+        client.callbacks["multiColorBox/report"]  = self._on_multicolor_box
+
+    # -------------------------------------------------------------------------
+    # MQTT callbacks (called from reader thread)
+    # -------------------------------------------------------------------------
+
+    def _on_temp(self, payload: dict):
+        d = payload.get("data") or {}
+        self._state["nozzle_temp"]   = float(d.get("curr_nozzle_temp", 0))
+        self._state["nozzle_target"] = float(d.get("target_nozzle_temp", 0))
+        self._state["bed_temp"]      = float(d.get("curr_hotbed_temp", 0))
+        self._state["bed_target"]    = float(d.get("target_hotbed_temp", 0))
+        self._push_status_update()
+
+    def _on_print(self, payload: dict):
+        d = payload.get("data") or {}
+        kobra_state = payload.get("state", "")
+        self._state["print_state"]    = KOBRA_TO_KLIPPER_STATE.get(kobra_state, "printing")
+        self._state["filename"]       = d.get("filename", self._state["filename"])
+        if "progress" in d:
+            self._state["progress"]   = float(d["progress"]) / 100.0
+        if "print_time" in d:
+            self._state["print_duration"] = int(d["print_time"]) * 60
+        if "curr_layer" in d:
+            self._state["curr_layer"] = d["curr_layer"]
+        if "total_layers" in d:
+            self._state["total_layers"] = d["total_layers"]
+        self._push_status_update()
+
+    def _on_info(self, payload: dict):
+        d = payload.get("data") or {}
+        self._state["printer_name"]     = d.get("printerName", self._state["printer_name"])
+        self._state["firmware_version"] = d.get("version", self._state["firmware_version"])
+        kobra_state = d.get("state", "")
+        if kobra_state:
+            self._state["print_state"] = KOBRA_TO_KLIPPER_STATE.get(kobra_state, "standby")
+        t = d.get("temp") or {}
+        if t:
+            self._state["nozzle_temp"]   = float(t.get("curr_nozzle_temp", 0))
+            self._state["nozzle_target"] = float(t.get("target_nozzle_temp", 0))
+            self._state["bed_temp"]      = float(t.get("curr_hotbed_temp", 0))
+            self._state["bed_target"]    = float(t.get("target_hotbed_temp", 0))
+        urls = d.get("urls") or {}
+        if urls.get("fileUploadurl"):
+            self._state["upload_url"] = urls["fileUploadurl"]
+        if urls.get("rtspUrl"):
+            self._state["camera_url"] = urls["rtspUrl"]
+        fan = d.get("fan_speed_pct")
+        if fan is not None:
+            self._state["fan_speed"] = int(fan)
+        self._push_status_update()
+
+    def _on_file(self, payload: dict):
+        d = payload.get("data") or {}
+        details = d.get("file_details") or {}
+        thumb = details.get("thumbnail") or details.get("png_image") or ""
+        if thumb:
+            self._thumbnail_b64 = thumb
+            log.info(f"Vorschaubild empfangen: {len(thumb)} Zeichen base64")
+        self._push_status_update()
+
+    def _on_multicolor_box(self, payload: dict):
+        boxes = (payload.get("data") or {}).get("multi_color_box") or []
+        if not boxes:
+            return
+        box = boxes[0]
+        slots = box.get("slots") or []
+        loaded = box.get("loaded_slot", -1)
+        if loaded != -1:
+            self._ams_loaded_slot = loaded
+        # Tip-Forming: nach Einziehen (status=10) oder Ausziehen (status=11)
+        # schickt der originale Slicer automatisch type=3 (Extruder-Rückzug)
+        fs = box.get("feed_status") or {}
+        current_status = fs.get("current_status")
+        slot_index = fs.get("slot_index", 0)
+        if current_status in (10, 11):
+            import threading
+            def _tip_form():
+                import time; time.sleep(2)
+                self.client.publish(
+                    "multiColorBox", "feedFilament",
+                    {"multi_color_box": [{"id": -1, "feed_status": {"slot_index": slot_index, "type": 3}}]},
+                    timeout=0
+                )
+                log.info(f"Tip-Forming (type=3) nach status={current_status} slot={slot_index}")
+            threading.Thread(target=_tip_form, daemon=True).start()
+        if slots:
+            self._ams_slots = slots
+            log.info(f"AMS-Slots empfangen: {len(slots)}, loaded_slot={self._ams_loaded_slot}")
+            self._push_status_update()
+
+    # -------------------------------------------------------------------------
+    # WebSocket push
+    # -------------------------------------------------------------------------
+
+    def _push_status_update(self):
+        if not self.ws_clients:
+            return
+        msg = {
+            "jsonrpc": "2.0",
+            "method":  "notify_status_update",
+            "params": [self._build_printer_objects(), time.time()],
+        }
+        text = json.dumps(msg)
+        dead = set()
+        for ws in self.ws_clients:
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send_str(text), ws._loop)
+            except Exception:
+                dead.add(ws)
+        self.ws_clients -= dead
+
+    def _build_printer_objects(self) -> dict:
+        s = self._state
+        return {
+            "extruder": {
+                "temperature": s["nozzle_temp"],
+                "target":      s["nozzle_target"],
+                "power":       0.0,
+            },
+            "heater_bed": {
+                "temperature": s["bed_temp"],
+                "target":      s["bed_target"],
+                "power":       0.0,
+            },
+            "print_stats": {
+                "state":          s["print_state"],
+                "filename":       s["filename"],
+                "print_duration": s["print_duration"],
+                "total_duration": s["print_duration"],
+                "info": {
+                    "current_layer": s["curr_layer"],
+                    "total_layer":   s["total_layers"],
+                },
+            },
+            "display_status": {
+                "progress": s["progress"],
+                "message":  "",
+            },
+            "virtual_sdcard": {
+                "progress":  s["progress"],
+                "is_active": s["print_state"] == "printing",
+                "file_path": s["filename"],
+            },
+            "toolhead": {
+                "position":         [0, 0, 0, 0],
+                "homed_axes":       "xyz",
+                "print_time":       s["print_duration"],
+                "estimated_print_time": s["print_duration"],
+            },
+        }
+
+    # -------------------------------------------------------------------------
+    # HTTP handlers
+    # -------------------------------------------------------------------------
+
+    async def handle_server_info(self, request):
+        return web.json_response({
+            "result": {
+                "klippy_connected": True,
+                "klippy_state":     "ready",
+                "components":       ["file_manager", "job_state", "virtual_sdcard"],
+                "failed_components":[],
+                "registered_directories": ["gcodes"],
+                "warnings":         [],
+                "websocket_count":  len(self.ws_clients),
+                "moonraker_version": MOONRAKER_VERSION,
+                "api_version":      [1, 3, 0],
+                "api_version_string": "1.3.0",
+            }
+        })
+
+    async def handle_printer_info(self, request):
+        s = self._state
+        return web.json_response({
+            "result": {
+                "state":           "ready",
+                "state_message":   "Printer is ready",
+                "hostname":        "kobrax-bridge",
+                "klipper_path":    "/home/pi/klipper",
+                "python_path":     "/home/pi/klippy-env/bin/python",
+                "log_file":        "/tmp/klippy.log",
+                "config_file":     "/home/pi/printer.cfg",
+                "software_version": KLIPPER_VERSION,
+                "cpu_info":        s["printer_name"],
+            }
+        })
+
+    async def handle_machine_system_info(self, request):
+        return web.json_response({
+            "result": {
+                "system_info": {
+                    "cpu_info": {"cpu_count": 4, "bits": "64bit", "processor": "armv7l",
+                                 "cpu_desc": "Anycubic Kobra X Bridge", "serial_number": "",
+                                 "hardware_desc": "", "model": "Kobra X Bridge",
+                                 "total_memory": 524288, "memory_units": "kB"},
+                    "sd_info": {},
+                    "distribution": {"name": "Linux", "id": "linux", "version": "1.0",
+                                     "version_parts": {}, "like": "", "codename": ""},
+                    "available_services": [],
+                    "service_state": {},
+                    "python": {"version": list(sys.version_info[:3]), "version_string": sys.version},
+                    "network": {},
+                    "canbus": {},
+                }
+            }
+        })
+
+    async def handle_objects_query(self, request):
+        objects = self._build_printer_objects()
+        # filter by requested objects if specified
+        requested = dict(request.rel_url.query)
+        if requested:
+            filtered = {k: objects[k] for k in requested if k in objects}
+        else:
+            filtered = objects
+        return web.json_response({"result": {"status": filtered, "eventtime": time.time()}})
+
+    async def handle_objects_list(self, request):
+        return web.json_response({
+            "result": {
+                "objects": list(self._build_printer_objects().keys())
+            }
+        })
+
+    async def handle_objects_subscribe(self, request):
+        return web.json_response({
+            "result": {
+                "status": self._build_printer_objects(),
+                "eventtime": time.time(),
+            }
+        })
+
+    async def handle_files_list(self, request):
+        filename = self._state.get("filename", "")
+        files = []
+        if filename:
+            files.append({
+                "path":     filename,
+                "modified": time.time(),
+                "size":     0,
+                "permissions": "rw",
+            })
+        return web.json_response({"result": files})
+
+    async def handle_file_upload(self, request):
+        log.info(f"Upload-Request: {request.method} {request.path_qs}  CT={request.headers.get('Content-Type','')[:60]}")
+        ct = request.headers.get("Content-Type", "")
+        if "multipart" not in ct:
+            return web.json_response({"error": "expected multipart"}, status=400)
+        reader = await request.multipart()
+        file_data = None
+        remote_filename = self._last_uploaded_file or "upload.gcode"
+
+        async for part in reader:
+            if part.name in ("file", "gcode", "upload_file"):
+                remote_filename = part.filename or remote_filename
+                file_data = await part.read()
+                log.info(f"Multipart-Feld '{part.name}': {remote_filename} ({len(file_data)} bytes)")
+            elif part.name == "path":
+                val = (await part.read()).decode("utf-8", errors="replace").strip()
+                if val:
+                    remote_filename = val
+            else:
+                log.debug(f"Unbekanntes Multipart-Feld: {part.name}")
+
+        if not file_data:
+            return web.json_response({"error": "no file received"}, status=400)
+
+        file_md5  = hashlib.md5(file_data).hexdigest()
+        file_size = len(file_data)
+
+        # Datei auf Disk ablegen (temp-Verzeichnis) damit Drucker sie per HTTP abrufen kann
+        safe_name = os.path.basename(remote_filename)  # keine Pfad-Traversal
+        serve_path = os.path.join(self._serve_dir_path, safe_name)
+        with open(serve_path, "wb") as f:
+            f.write(file_data)
+        del file_data  # RAM freigeben
+
+        self._last_uploaded_file = remote_filename
+        log.info(f"Upload: {remote_filename} ({file_size} bytes) md5={file_md5} → Drucker")
+
+        # Datei per HTTP auf den Drucker hochladen (serve_path liegt bereits auf Disk)
+        upload_url = self._state.get("upload_url") or None
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, self.client.upload_gcode, serve_path, remote_filename, upload_url
+            )
+        except Exception as e:
+            log.error(f"Upload fehlgeschlagen: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+        log.info(f"Upload erfolgreich: {result}")
+
+        # Druck starten mit vollständigem Payload (inkl. serve-URL + md5 + size)
+        serve_url = f"http://{request.host}/serve/{remote_filename}"
+        log.info(f"Starte Druck automatisch: {remote_filename}")
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, lambda: self._start_print(remote_filename, serve_url, file_md5, file_size))
+
+        # OctoPrint-kompatibler Response (OrcaSlicer wertet refs aus)
+        return web.json_response({
+            "done": True,
+            "files": {
+                "local": {
+                    "name": remote_filename,
+                    "origin": "local",
+                    "path": remote_filename,
+                    "refs": {
+                        "download": f"http://{request.host}/api/files/local/{remote_filename}",
+                        "resource":  f"http://{request.host}/api/files/local/{remote_filename}",
+                    }
+                }
+            },
+            "result": {
+                "item": {"path": remote_filename, "root": "gcodes"},
+                "action": "create_file",
+            }
+        }, status=201)
+
+    def _start_print(self, filename: str, url: str = "", md5: str = "", filesize: int = 0):
+        use_ams = len(self._ams_slots) > 0
+        ams_box_mapping = [
+            {
+                "paint_index":  i,
+                "ams_index":    i,
+                "paint_color":  [255, 255, 255, 255],
+                "ams_color":    [255, 255, 255, 255],
+                "material_type": s.get("material_type", "PLA"),
+            }
+            for i, s in enumerate(self._ams_slots)
+        ]
+        payload = {
+            "taskid":       "-1",
+            "url":          url,
+            "filename":     filename,
+            "md5":          md5,
+            "filepath":     None,
+            "filetype":     1,
+            "project_type": 1,
+            "filesize":     filesize,
+            "ams_settings": {
+                "use_ams":        use_ams,
+                "ams_box_mapping": ams_box_mapping,
+            },
+            "task_settings": {
+                "auto_leveling":            1,
+                "vibration_compensation":   0,
+                "flow_calibration":         0,
+                "dry_mode":                 0,
+                "ai_settings":   {"status": 0, "count": 0, "type": 1},
+                "timelapse":     {"status": 0, "count": 0, "type": 64},
+                "drying_settings": {"status": 0, "target_temp": 0, "duration": 0, "remain_time": 0},
+                "model_objects_skip_parts": [],
+            },
+        }
+        # Thumbnail vorab anfordern (Drucker antwortet async auf file/report)
+        self._thumbnail_b64 = ""
+        self.client.publish("file", "fileDetails",
+                            {"root": "local", "filename": filename}, timeout=0)
+
+        log.info(f"print/start → {filename}  url={url}  ams={len(self._ams_slots)} slots")
+        result = self.client.publish("print", "start", payload, timeout=15.0)
+        if result:
+            log.info(f"Druckstart bestätigt: state={result.get('state')}")
+        else:
+            log.warning("Druckstart: keine Antwort vom Drucker")
+
+    async def handle_print_start(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        filename = body.get("filename") or self._last_uploaded_file
+        if not filename:
+            return web.json_response({"error": "no filename"}, status=400)
+
+        log.info(f"Druck starten: {filename}")
+
+        # AMS-Mapping aus gecachtem State
+        ams_box_mapping = []
+        for i, slot in enumerate(self._ams_slots):
+            ams_box_mapping.append({
+                "slot_index": i,
+                "material_type": slot.get("material_type", "PLA"),
+                "color": slot.get("color", "FFFFFF"),
+            })
+
+        use_ams = len(self._ams_slots) > 0
+
+        payload = {
+            "filename": filename,
+            "taskid":   str(int(time.time())),
+            "use_ams":  use_ams,
+        }
+        if ams_box_mapping:
+            payload["ams_box_mapping"] = ams_box_mapping
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self.client.publish("print", "start", payload, timeout=15.0)
+        )
+        if result is None:
+            return web.json_response({"error": "Keine Antwort vom Drucker"}, status=504)
+
+        return web.json_response({"result": "ok"})
+
+    async def handle_print_pause(self, request):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.client.pause_print)
+        return web.json_response({"result": "ok"})
+
+    async def handle_print_resume(self, request):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.client.resume_print)
+        return web.json_response({"result": "ok"})
+
+    async def handle_print_cancel(self, request):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.client.stop_print)
+        return web.json_response({"result": "ok"})
+
+    async def handle_octoprint_version(self, request):
+        return web.json_response({
+            "api":     "0.1",
+            "server":  "1.9.0",
+            "text":    "OctoPrint (Kobra X Bridge)",
+        })
+
+    async def handle_index(self, request):
+        html = r"""<!DOCTYPE html>
+<html lang="de" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kobra X</title>
+<style>
+:root{
+  --bg:#1a1a1f;--card:#24242c;--raised:#2e2e3a;--border:#3a3a4a;
+  --txt:#f0f0f5;--txt2:#8888aa;--accent:#00c8ff;--accent2:#ff6b35;
+  --ok:#4cde80;--err:#ff4d6d;--warn:#ffb020;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono","Fira Code",monospace;
+}
+[data-theme=light]{
+  --bg:#f0f0f5;--card:#fff;--raised:#e8e8f0;--border:#d0d0e0;
+  --txt:#1a1a2e;--txt2:#666680;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:var(--font);font-size:14px;min-height:100vh;display:flex;flex-direction:column}
+a{color:var(--accent);text-decoration:none}
+
+/* ── HEADER ── */
+header{background:var(--card);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;padding:0 20px;height:52px;
+  position:sticky;top:0;z-index:100}
+.logo{font-size:18px;font-weight:700;color:var(--accent);letter-spacing:-.02em}
+.hname{font-size:13px;color:var(--txt2);flex:1}
+.hbadge{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;
+  padding:4px 10px;border-radius:20px;background:var(--raised);color:var(--txt2);
+  text-transform:uppercase;letter-spacing:.04em}
+.hbadge.printing{background:#0d2d1a;color:var(--ok)}
+.hbadge.complete{background:#0d1f38;color:#60b0ff}
+.hbadge.error{background:#2d0d0d;color:var(--err)}
+.hbadge .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.hbadge.printing .dot{animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.theme-btn{background:none;border:1px solid var(--border);color:var(--txt2);
+  border-radius:8px;padding:6px 10px;cursor:pointer;font-size:13px;transition:.15s}
+.theme-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ── LAYOUT ── */
+.layout{display:flex;flex:1;min-height:0}
+nav.sidebar{width:200px;background:var(--card);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:12px 8px;gap:2px;flex-shrink:0}
+.nav-btn{background:none;border:none;color:var(--txt2);text-align:left;
+  padding:9px 12px;border-radius:8px;cursor:pointer;font-size:13px;
+  display:flex;align-items:center;gap:10px;transition:.12s;width:100%}
+.nav-btn:hover{background:var(--raised);color:var(--txt)}
+.nav-btn.active{background:var(--raised);color:var(--accent)}
+.nav-icon{font-size:16px;width:20px;text-align:center}
+main{flex:1;overflow-y:auto;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+
+/* ── CARD ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;
+  padding:18px;transition:box-shadow .15s,transform .15s}
+.card:hover{box-shadow:0 4px 20px rgba(0,0,0,.3);transform:translateY(-1px)}
+.card-title{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--txt2);
+  margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card-title span{font-size:14px}
+
+/* ── HERO ── */
+.hero{grid-column:1/-1;display:grid;grid-template-columns:1fr 320px;gap:16px}
+@media(max-width:900px){.hero{grid-template-columns:1fr}}
+.cam-wrap{background:#0a0a0e;border-radius:10px;overflow:hidden;
+  min-height:180px;max-height:320px;display:flex;align-items:center;justify-content:center;position:relative}
+.cam-wrap img,.cam-wrap video{width:100%;max-height:320px;height:auto;display:block;object-fit:contain}
+.cam-placeholder{color:var(--txt2);font-size:13px;text-align:center;padding:20px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.cam-spinner{width:40px;height:40px;border:3px solid rgba(255,255,255,.15);
+  border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:none}
+.cam-overlay{position:absolute;bottom:0;left:0;right:0;
+  background:linear-gradient(transparent,rgba(0,0,0,.75));padding:14px}
+.cam-toggle{position:absolute;top:10px;right:10px;background:rgba(0,0,0,.5);
+  border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:8px;
+  padding:6px 10px;cursor:pointer;font-size:12px;backdrop-filter:blur(4px)}
+.cam-toggle:hover{background:rgba(0,0,0,.7)}
+
+/* ── PROGRESS ── */
+.hero-info{display:flex;flex-direction:column;gap:12px}
+.pct-big{font-size:52px;font-weight:700;line-height:1;color:var(--txt)}
+.pct-big small{font-size:20px;font-weight:400;color:var(--txt2)}
+.progress-bar{height:8px;background:var(--raised);border-radius:4px;overflow:hidden;margin:4px 0}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),#0080cc);
+  border-radius:4px;transition:width .6s ease}
+.meta-row{display:flex;justify-content:space-between;font-size:12px;color:var(--txt2)}
+.layer-badge{background:var(--raised);border-radius:6px;padding:4px 8px;
+  font-family:var(--mono);font-size:12px;color:var(--txt)}
+.fname{font-size:12px;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  background:var(--raised);border-radius:6px;padding:6px 8px}
+
+/* ── PRINT CONTROLS ── */
+.ctrl-btns{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:600;
+  cursor:pointer;transition:opacity .15s,transform .1s;white-space:nowrap}
+.btn:hover{opacity:.85;transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn-start{background:var(--ok);color:#0d2010}
+.btn-pause{background:var(--raised);color:var(--txt);border:1px solid var(--border)}
+.btn-resume{background:#0d2d1a;color:var(--ok);border:1px solid var(--ok)}
+.btn-cancel{background:#2d0d0d;color:var(--err);border:1px solid var(--err)}
+.btn-accent{background:var(--accent);color:#001a24}
+.btn-sm{padding:7px 12px;font-size:12px}
+
+/* ── TEMPS ── */
+.temp-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.temp-block{background:var(--raised);border-radius:10px;padding:14px;position:relative}
+.temp-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--txt2);margin-bottom:6px}
+.temp-row{display:flex;align-items:baseline;gap:6px}
+.temp-val{font-size:30px;font-weight:700;font-family:var(--mono)}
+.temp-unit{font-size:14px;color:var(--txt2)}
+.temp-target{font-size:11px;color:var(--txt2);margin-top:2px}
+.temp-arc{position:absolute;top:12px;right:12px}
+.temp-edit{display:flex;gap:6px;margin-top:10px}
+.temp-input{background:var(--bg);border:1px solid var(--border);color:var(--txt);
+  border-radius:6px;padding:5px 8px;font-size:13px;font-family:var(--mono);width:70px}
+.temp-input:focus{outline:none;border-color:var(--accent)}
+.chart-wrap{margin-top:12px}
+canvas.tchart{width:100%;height:60px;display:block;border-radius:6px;background:var(--raised)}
+
+/* ── MOTION ── */
+.joypad{display:grid;grid-template-columns:repeat(3,52px);
+  grid-template-rows:repeat(3,52px);gap:6px;justify-content:center;margin:8px auto}
+.joy{background:var(--raised);border:1px solid var(--border);color:var(--txt);
+  border-radius:10px;font-size:18px;cursor:pointer;transition:.12s;
+  display:flex;align-items:center;justify-content:center}
+.joy:hover{background:var(--accent);color:#001a24;border-color:var(--accent)}
+.joy:active{transform:scale(.93)}
+.joy.home{font-size:14px;background:var(--bg)}
+.step-btns{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin-top:10px}
+.step-btn{background:var(--raised);border:1px solid var(--border);color:var(--txt2);
+  border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;transition:.12s}
+.step-btn.active,.step-btn:hover{background:var(--accent);color:#001a24;border-color:var(--accent)}
+.home-btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;justify-content:center}
+
+/* ── AMS ── */
+.ams-slots{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.ams-slot{background:var(--raised);border-radius:10px;padding:10px;text-align:center;
+  border:2px solid transparent;transition:.2s;position:relative}
+.ams-slot.active{border-color:var(--slot-color,var(--accent));
+  box-shadow:0 0 12px rgba(var(--slot-rgb,0,200,255),.3)}
+.slot-circle{width:36px;height:36px;border-radius:50%;margin:0 auto 6px;border:2px solid rgba(255,255,255,.15)}
+.slot-label{font-size:11px;color:var(--txt2);font-family:var(--mono)}
+.slot-material{font-size:12px;font-weight:600;margin-bottom:2px}
+
+/* ── LIGHT + FAN ── */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.toggle-label{font-size:13px;font-weight:600}
+.toggle{position:relative;width:44px;height:24px;cursor:pointer}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.toggle-track{width:44px;height:24px;background:var(--raised);border-radius:12px;
+  border:1px solid var(--border);transition:.25s;display:block}
+.toggle input:checked+.toggle-track{background:var(--accent)}
+.toggle-thumb{position:absolute;top:3px;left:3px;width:18px;height:18px;
+  background:#fff;border-radius:50%;transition:.25s;pointer-events:none}
+.toggle input:checked~.toggle-thumb{transform:translateX(20px)}
+.slider-row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.slider-label{font-size:12px;color:var(--txt2);width:80px}
+.slider{flex:1;-webkit-appearance:none;height:4px;border-radius:2px;
+  background:var(--raised);outline:none;cursor:pointer}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;
+  border-radius:50%;background:var(--accent);cursor:pointer;transition:.1s}
+.slider::-webkit-slider-thumb:hover{transform:scale(1.2)}
+.slider-val{font-family:var(--mono);font-size:12px;color:var(--txt);width:30px;text-align:right}
+
+/* ── CONSOLE ── */
+.console{background:#0a0a0e;border-radius:8px;padding:10px;font-family:var(--mono);
+  font-size:11px;color:#8888aa;height:160px;overflow-y:auto;line-height:1.6}
+.console .ts{color:#444;margin-right:6px}
+.console .msg-info{color:#8888aa}
+.console .msg-ok{color:var(--ok)}
+.console .msg-err{color:var(--err)}
+.console .msg-warn{color:var(--warn)}
+
+/* ── PANELS ── */
+.panel{display:none}
+.panel.active{display:block}
+
+/* ── BOTTOM NAV (mobile) ── */
+nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
+  background:var(--card);border-top:1px solid var(--border);
+  justify-content:space-around;padding:8px 0 max(8px,env(safe-area-inset-bottom))}
+.bnav-btn{background:none;border:none;color:var(--txt2);display:flex;
+  flex-direction:column;align-items:center;gap:3px;cursor:pointer;font-size:10px;padding:4px 8px}
+.bnav-btn.active{color:var(--accent)}
+.bnav-icon{font-size:20px}
+
+@media(max-width:768px){
+  nav.sidebar{display:none}
+  nav.bottom-nav{display:flex}
+  main{padding:12px;padding-bottom:72px}
+  .hero{grid-template-columns:1fr}
+  .temp-pair{grid-template-columns:1fr}
+  .ams-slots{grid-template-columns:repeat(2,1fr)}
+  .joypad{grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,48px)}
+}
+@media(min-width:769px) and (max-width:1200px){
+  nav.sidebar{width:52px;padding:12px 4px}
+  .nav-btn .nav-text{display:none}
+  .nav-btn{justify-content:center;padding:10px}
+  .nav-icon{width:auto}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⬡ Kobra X</div>
+  <div class="hname" id="h-pname">Anycubic Kobra X</div>
+  <div class="hbadge" id="h-badge"><span class="dot"></span><span id="h-state">Standby</span></div>
+  <button class="theme-btn" onclick="toggleTheme()">☀ / ☾</button>
+  <button class="theme-btn" onclick="toggleLang()" id="lang-btn">EN</button>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+    <button class="nav-btn active" onclick="showPanel('dashboard')" id="nb-dashboard">
+      <span class="nav-icon">⊞</span><span class="nav-text">Dashboard</span></button>
+    <button class="nav-btn" onclick="showPanel('print')" id="nb-print">
+      <span class="nav-icon">◉</span><span class="nav-text">Druck</span></button>
+    <button class="nav-btn" onclick="showPanel('temps')" id="nb-temps">
+      <span class="nav-icon">⊙</span><span class="nav-text">Temperaturen</span></button>
+    <button class="nav-btn" onclick="showPanel('motion')" id="nb-motion">
+      <span class="nav-icon">✛</span><span class="nav-text">Achsen</span></button>
+    <button class="nav-btn" onclick="showPanel('ams')" id="nb-ams">
+      <span class="nav-icon">◫</span><span class="nav-text">AMS</span></button>
+    <button class="nav-btn" onclick="showPanel('extras')" id="nb-extras">
+      <span class="nav-icon">⊜</span><span class="nav-text">Licht / Lüfter</span></button>
+    <button class="nav-btn" onclick="showPanel('console')" id="nb-console">
+      <span class="nav-icon">≡</span><span class="nav-text">Konsole</span></button>
+  </nav>
+
+  <main>
+    <!-- ═══ DASHBOARD ═══ -->
+    <div class="panel active" id="panel-dashboard">
+      <div class="grid">
+        <div class="hero card" style="grid-column:1/-1">
+          <div style="display:grid;grid-template-columns:1fr 300px;gap:16px">
+            <div class="cam-wrap" id="cam-wrap">
+              <div class="cam-placeholder" id="cam-placeholder">📷 Kamera nicht gestartet</div>
+              <div class="cam-spinner" id="cam-spinner"></div>
+              <img id="cam-img" style="display:none;width:100%;height:auto" alt="Kamera">
+              <div class="cam-overlay" id="cam-overlay" style="display:none">
+                <div style="font-size:12px;color:#fff" id="cam-fname"></div>
+              </div>
+              <button class="cam-toggle" onclick="toggleCam()" id="cam-toggle-btn">▶ Kamera</button>
+            </div>
+            <div class="hero-info">
+              <img id="d-thumbnail" src="" alt="" style="display:none;width:100%;max-height:140px;object-fit:contain;border-radius:8px;background:#111">
+              <div>
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--txt2);margin-bottom:6px" id="d-card-progress">Fortschritt</div>
+                <div class="pct-big"><span id="d-pct">0</span><small>%</small></div>
+                <div class="progress-bar" style="margin-top:8px"><div class="progress-fill" id="d-pbar" style="width:0%"></div></div>
+              </div>
+              <div class="meta-row">
+                <span id="d-elapsed">–</span>
+                <span id="d-layers" class="layer-badge">–</span>
+              </div>
+              <div class="fname" id="d-fname" title="">–</div>
+              <div class="ctrl-btns" id="d-ctrl-btns">
+                <button class="btn btn-pause btn-sm" id="d-btn-pause" onclick="printAction('pause')">⏸ Pause</button>
+                <button class="btn btn-resume btn-sm" id="d-btn-resume" onclick="printAction('resume')">▶ Weiter</button>
+                <button class="btn btn-cancel btn-sm" id="d-btn-cancel" onclick="confirmCancel()">✕ Stopp</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- mini temp card -->
+        <div class="card">
+          <div class="card-title"><span>⊙</span> <span id="d-card-temps">Temperaturen</span></div>
+          <div class="temp-pair">
+            <div class="temp-block">
+              <div class="temp-label">Nozzle</div>
+              <div class="temp-row">
+                <div class="temp-val" id="d-nt">–</div>
+                <div class="temp-unit">°C</div>
+              </div>
+              <div class="temp-target">→ <span id="d-nt-t">0</span>°C</div>
+              <svg class="temp-arc" width="40" height="40" viewBox="0 0 40 40">
+                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--raised)" stroke-width="4"/>
+                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--accent2)" stroke-width="4"
+                  stroke-dasharray="100.5" stroke-dashoffset="100.5" id="d-narc"
+                  stroke-linecap="round" transform="rotate(-90 20 20)" style="transition:stroke-dashoffset .8s"/>
+              </svg>
+            </div>
+            <div class="temp-block">
+              <div class="temp-label">Bett</div>
+              <div class="temp-row">
+                <div class="temp-val" id="d-bt">–</div>
+                <div class="temp-unit">°C</div>
+              </div>
+              <div class="temp-target">→ <span id="d-bt-t">0</span>°C</div>
+              <svg class="temp-arc" width="40" height="40" viewBox="0 0 40 40">
+                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--raised)" stroke-width="4"/>
+                <circle cx="20" cy="20" r="16" fill="none" stroke="#ff6b35" stroke-width="4"
+                  stroke-dasharray="100.5" stroke-dashoffset="100.5" id="d-barc"
+                  stroke-linecap="round" transform="rotate(-90 20 20)" style="transition:stroke-dashoffset .8s"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <!-- mini light+fan -->
+        <div class="card">
+          <div class="card-title"><span>⊜</span> <span id="d-card-lightfan">Licht &amp; Lüfter</span></div>
+          <div class="toggle-row">
+            <span class="toggle-label">💡 Licht</span>
+            <label class="toggle">
+              <input type="checkbox" id="d-light-toggle" onchange="setLight()">
+              <span class="toggle-track"></span>
+              <span class="toggle-thumb"></span>
+            </label>
+          </div>
+          <div class="slider-row" style="margin-top:12px">
+            <span class="slider-label">🌀 Lüfter</span>
+            <input type="range" class="slider" min="0" max="100" value="0" id="d-fan" oninput="document.getElementById('d-fan-val').textContent=this.value" onchange="setFan()">
+            <span class="slider-val" id="d-fan-val">0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ DRUCK ═══ -->
+    <div class="panel" id="panel-print">
+      <div class="grid">
+        <div class="card">
+          <div class="card-title"><span>◉</span> <span id="ptitle-print">Drucksteuerung</span></div>
+          <div style="text-align:center;margin-bottom:16px">
+            <div class="pct-big"><span id="p-pct">0</span><small>%</small></div>
+            <div class="progress-bar" style="margin:8px 0"><div class="progress-fill" id="p-pbar" style="width:0%"></div></div>
+            <div class="meta-row" style="margin-top:4px">
+              <span id="p-elapsed">–</span>
+              <span id="p-layers" class="layer-badge">–</span>
+            </div>
+            <div class="fname" style="margin-top:8px" id="p-fname">–</div>
+          </div>
+          <div class="ctrl-btns" style="justify-content:center">
+            <button class="btn btn-pause" id="p-btn-pause" onclick="printAction('pause')">⏸ Pause</button>
+            <button class="btn btn-resume" id="p-btn-resume" onclick="printAction('resume')">▶ Fortsetzen</button>
+            <button class="btn btn-cancel" id="p-btn-cancel" onclick="confirmCancel()">✕ Abbrechen</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>⊙</span> <span id="p-title-temps">Temperaturen (Live)</span></div>
+          <canvas id="p-chart" class="tchart" width="600" height="120"></canvas>
+          <div class="temp-pair" style="margin-top:12px">
+            <div class="temp-block">
+              <div class="temp-label">Nozzle</div>
+              <div class="temp-row">
+                <div class="temp-val" id="p-nt">–</div><div class="temp-unit">°C</div>
+              </div>
+              <div class="temp-target">→ <span id="p-nt-t">0</span>°C</div>
+              <div class="temp-edit">
+                <input type="number" class="temp-input" id="p-nozzle-inp" placeholder="Ziel" min="0" max="300">
+                <button class="btn btn-sm btn-accent" onclick="setNozzle()">Set</button>
+              </div>
+            </div>
+            <div class="temp-block">
+              <div class="temp-label">Bett</div>
+              <div class="temp-row">
+                <div class="temp-val" id="p-bt">–</div><div class="temp-unit">°C</div>
+              </div>
+              <div class="temp-target">→ <span id="p-bt-t">0</span>°C</div>
+              <div class="temp-edit">
+                <input type="number" class="temp-input" id="p-bed-inp" placeholder="Ziel" min="0" max="120">
+                <button class="btn btn-sm btn-accent" onclick="setBed()">Set</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TEMPS ═══ -->
+    <div class="panel" id="panel-temps">
+      <div class="grid">
+        <div class="card">
+          <div class="card-title"><span>⊙</span> <span id="ptitle-temps-nozzle">Nozzle</span></div>
+          <div class="temp-row">
+            <div class="temp-val" style="font-size:48px" id="t-nt">–</div>
+            <div class="temp-unit" style="font-size:20px">°C</div>
+          </div>
+          <div class="temp-target" style="margin-top:4px">Ziel: <span id="t-nt-t">0</span>°C</div>
+          <div class="progress-bar" style="margin:12px 0 0">
+            <div class="progress-fill" id="t-ntbar" style="width:0%;background:linear-gradient(90deg,var(--accent2),#ffb020)"></div>
+          </div>
+          <div class="temp-edit" style="margin-top:12px">
+            <input type="number" class="temp-input" id="t-nozzle-inp" placeholder="Ziel °C" min="0" max="300">
+            <button class="btn btn-accent" onclick="setNozzle2()">Setzen</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('t-nozzle-inp').value=0;setNozzle2()">Aus</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>⊙</span> <span id="ptitle-temps-bed">Heizbett</span></div>
+          <div class="temp-row">
+            <div class="temp-val" style="font-size:48px" id="t-bt">–</div>
+            <div class="temp-unit" style="font-size:20px">°C</div>
+          </div>
+          <div class="temp-target" style="margin-top:4px">Ziel: <span id="t-bt-t">0</span>°C</div>
+          <div class="progress-bar" style="margin:12px 0 0">
+            <div class="progress-fill" id="t-btbar" style="width:0%;background:linear-gradient(90deg,#ff6b35,var(--warn))"></div>
+          </div>
+          <div class="temp-edit" style="margin-top:12px">
+            <input type="number" class="temp-input" id="t-bed-inp" placeholder="Ziel °C" min="0" max="120">
+            <button class="btn btn-accent" onclick="setBed2()">Setzen</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('t-bed-inp').value=0;setBed2()">Aus</button>
+          </div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+          <div class="card-title"><span>◈</span> <span id="ptitle-temps-chart">Verlauf (letzte 60 Messungen)</span></div>
+          <canvas id="t-chart" width="800" height="140" style="width:100%;height:140px;background:var(--raised);border-radius:8px"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ MOTION ═══ -->
+    <div class="panel" id="panel-motion">
+      <div class="grid">
+        <div class="card">
+          <div class="card-title"><span>✛</span> <span id="ptitle-motion-xy">XY-Achsen</span></div>
+          <div class="joypad">
+            <div></div>
+            <button class="joy" onclick="move(1,1,getStep())" title="Y+">▲</button>
+            <div></div>
+            <button class="joy" onclick="move(0,-1,getStep())" title="X−">◀</button>
+            <button class="joy home" onclick="homeAll()" title="Home All">⌂</button>
+            <button class="joy" onclick="move(0,1,getStep())" title="X+">▶</button>
+            <div></div>
+            <button class="joy" onclick="move(1,-1,getStep())" title="Y−">▼</button>
+            <div></div>
+          </div>
+          <div class="step-btns">
+            <button class="step-btn" onclick="setStep(this,0.1)">0.1</button>
+            <button class="step-btn active" onclick="setStep(this,1)">1</button>
+            <button class="step-btn" onclick="setStep(this,5)">5</button>
+            <button class="step-btn" onclick="setStep(this,10)">10 mm</button>
+          </div>
+          <div class="home-btns">
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="homeAxis('X')"><span class="lbl-home-x">Home X</span></button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="homeAxis('Y')"><span class="lbl-home-y">Home Y</span></button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="homeAxis('Z')"><span class="lbl-home-z">Home Z</span></button>
+            <button class="btn btn-sm btn-accent" onclick="homeAll()"><span class="lbl-home-all">Home All</span></button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>↕</span> <span id="ptitle-motion-z">Z-Achse</span></div>
+          <div class="joypad" style="grid-template-columns:52px;grid-template-rows:repeat(2,52px)">
+            <button class="joy" onclick="move(2,-1,getStep())" title="Z−">▲</button>
+            <button class="joy" onclick="move(2,1,getStep())" title="Z+">▼</button>
+          </div>
+          <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--txt2)">Schrittweite: <span id="step-display">1</span> mm</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ AMS ═══ -->
+    <div class="panel" id="panel-ams">
+      <div class="card">
+        <div class="card-title"><span>◫</span> <span id="ptitle-ams">AMS / Filamentbox</span></div>
+        <div class="ams-slots" id="ams-slots">
+          <div style="grid-column:1/-1;text-align:center;color:var(--txt2);padding:20px">
+            Keine AMS-Daten empfangen
+          </div>
+        </div>
+        <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
+          <div style="font-size:12px;color:var(--txt2);margin-bottom:2px">Slot auswählen</div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <input type="range" id="ams-slot-sel" min="0" max="3" step="1" value="0"
+              class="slider" style="flex:1"
+              oninput="document.getElementById('ams-slot-label').textContent='Slot '+(parseInt(this.value)+1)">
+            <span id="ams-slot-label" style="min-width:48px;font-size:13px;font-weight:600">Slot 1</span>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button class="btn" style="flex:1" onclick="amsFeed(1)">⬇ Einziehen</button>
+            <button id="btn-unload" class="btn" style="flex:1" onclick="amsFeed(2)">⬆ Ausziehen</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ EXTRAS ═══ -->
+    <div class="panel" id="panel-extras">
+      <div class="grid">
+        <div class="card">
+          <div class="card-title"><span>💡</span> <span id="ptitle-extras-light">Licht</span></div>
+          <div class="toggle-row">
+            <span class="toggle-label lbl-on-off">Ein / Aus</span>
+            <label class="toggle">
+              <input type="checkbox" id="e-light-toggle" onchange="setLight2()">
+              <span class="toggle-track"></span>
+              <span class="toggle-thumb"></span>
+            </label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>🌀</span> <span id="ptitle-extras-fan">Lüfter</span></div>
+          <div class="slider-row">
+            <span class="slider-label lbl-speed">Geschwindigkeit</span>
+            <input type="range" class="slider" min="0" max="100" value="0" id="e-fan" oninput="document.getElementById('e-fan-val').textContent=this.value" onchange="setFan2()">
+            <span class="slider-val" id="e-fan-val">0</span>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="quickFan(0)">Aus</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="quickFan(25)">25%</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="quickFan(50)">50%</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="quickFan(75)">75%</button>
+            <button class="btn btn-sm btn-accent" onclick="quickFan(100)">100%</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>📷</span> <span id="ptitle-extras-camera">Kamera</span></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm btn-accent" id="e-btn-cam-start" onclick="camStart()">▶ Start</button>
+            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" id="e-btn-cam-stop" onclick="camStop()">◼ Stop</button>
+          </div>
+          <div style="margin-top:10px;font-size:12px;color:var(--txt2)" id="e-cam-url">–</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ CONSOLE ═══ -->
+    <div class="panel" id="panel-console">
+      <div class="card">
+        <div class="card-title"><span>≡</span> <span id="ptitle-console">Ereignis-Log</span></div>
+        <div class="console" id="console-log"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<nav class="bottom-nav">
+  <button class="bnav-btn active" onclick="showPanel('dashboard')" id="bnb-dashboard"><span class="bnav-icon">⊞</span>Dashboard</button>
+  <button class="bnav-btn" onclick="showPanel('print')" id="bnb-print"><span class="bnav-icon">◉</span>Druck</button>
+  <button class="bnav-btn" onclick="showPanel('motion')" id="bnb-motion"><span class="bnav-icon">✛</span>Achsen</button>
+  <button class="bnav-btn" onclick="showPanel('extras')" id="bnb-extras"><span class="bnav-icon">⊜</span>Extras</button>
+  <button class="bnav-btn" onclick="showPanel('console')" id="bnb-console"><span class="bnav-icon">≡</span>Log</button>
+</nav>
+
+<script>
+// ── State ──
+var S={nozzle_temp:0,nozzle_target:0,bed_temp:0,bed_target:0,
+  print_state:'standby',filename:'',progress:0,print_duration:0,
+  curr_layer:0,total_layers:0,printer_name:'Kobra X',firmware_version:'–',
+  camera_url:'',fan_speed:0,light_on:false,light_brightness:80,ams_slots:[]};
+var tempHistory={n:[],b:[]};
+var camOn=false;
+var currentStep=1;
+var currentPanel='dashboard';
+
+// ── Theme ──
+function toggleTheme(){
+  var h=document.documentElement;
+  h.setAttribute('data-theme',h.getAttribute('data-theme')==='dark'?'light':'dark');
+  localStorage.setItem('theme',h.getAttribute('data-theme'));
+}
+(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})();
+
+// ── i18n ──
+var LANG_DE={
+  header_status_standby:'Bereit',header_status_printing:'Druckt',header_status_complete:'Fertig',header_status_error:'Fehler',
+  nav_dashboard:'Dashboard',nav_print:'Druck',nav_temps:'Temperaturen',nav_motion:'Achsen',nav_ams:'AMS',nav_extras:'Licht / Lüfter',nav_console:'Konsole',
+  card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Licht & Lüfter',
+  cam_placeholder:'📷 Kamera nicht gestartet',btn_cam_start:'▶ Kamera',btn_cam_stop:'◼ Kamera',
+  btn_pause:'⏸ Pause',btn_resume:'▶ Weiter',btn_cancel:'✕ Stopp',
+  label_nozzle:'Nozzle',label_bed:'Bett',label_fan:'🌀 Lüfter',label_light:'💡 Licht',label_on_off:'Ein / Aus',label_speed:'Geschwindigkeit',
+  panel_print_title:'Drucksteuerung',panel_print_btn_pause:'⏸ Pause',panel_print_btn_resume:'▶ Fortsetzen',panel_print_btn_cancel:'✕ Abbrechen',panel_print_temps_live:'Temperaturen (Live)',
+  label_set:'Setzen',label_off:'Aus',
+  panel_temps_nozzle:'Nozzle',panel_temps_bed:'Heizbett',panel_temps_chart:'Verlauf (letzte 60 Messungen)',label_target_c:'Ziel:',
+  panel_motion_xy:'XY-Achsen',panel_motion_z:'Z-Achse',label_step:'Schrittweite:',btn_home_x:'Home X',btn_home_y:'Home Y',btn_home_z:'Home Z',btn_home_all:'Home All',
+  panel_ams_title:'AMS / Filamentbox',ams_no_data:'Keine AMS-Daten empfangen',label_slot:'Slot',
+  panel_extras_light:'Licht',panel_extras_fan:'Lüfter',panel_extras_camera:'Kamera',btn_cam_start2:'▶ Start',btn_cam_stop2:'◼ Stop',
+  panel_console_title:'Ereignis-Log',
+  log_light_on:'Licht an',log_light_off:'Licht aus',log_fan:'Lüfter →',log_nozzle:'Nozzle →',log_bed:'Bett →',log_axis:'Achse',log_home:'Home',log_home_all:'Home All',log_cam_start:'Kamera gestartet:',log_cam_stop:'Kamera gestoppt',log_poll_error:'Poll-Fehler:',log_error:'Fehler:',
+  confirm_cancel:'Druck wirklich abbrechen?'
+};
+var LANG_EN={
+  header_status_standby:'Ready',header_status_printing:'Printing',header_status_complete:'Complete',header_status_error:'Error',
+  nav_dashboard:'Dashboard',nav_print:'Print',nav_temps:'Temperatures',nav_motion:'Motion',nav_ams:'AMS',nav_extras:'Light / Fan',nav_console:'Console',
+  card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Light & Fan',
+  cam_placeholder:'📷 Camera not started',btn_cam_start:'▶ Camera',btn_cam_stop:'◼ Camera',
+  btn_pause:'⏸ Pause',btn_resume:'▶ Resume',btn_cancel:'✕ Stop',
+  label_nozzle:'Nozzle',label_bed:'Bed',label_fan:'🌀 Fan',label_light:'💡 Light',label_on_off:'On / Off',label_speed:'Speed',
+  panel_print_title:'Print Control',panel_print_btn_pause:'⏸ Pause',panel_print_btn_resume:'▶ Resume',panel_print_btn_cancel:'✕ Cancel',panel_print_temps_live:'Temperatures (Live)',
+  label_set:'Set',label_off:'Off',
+  panel_temps_nozzle:'Nozzle',panel_temps_bed:'Heated Bed',panel_temps_chart:'History (last 60 readings)',label_target_c:'Target:',
+  panel_motion_xy:'XY Axes',panel_motion_z:'Z Axis',label_step:'Step size:',btn_home_x:'Home X',btn_home_y:'Home Y',btn_home_z:'Home Z',btn_home_all:'Home All',
+  panel_ams_title:'AMS / Filament Box',ams_no_data:'No AMS data received',label_slot:'Slot',
+  panel_extras_light:'Light',panel_extras_fan:'Fan',panel_extras_camera:'Camera',btn_cam_start2:'▶ Start',btn_cam_stop2:'◼ Stop',
+  panel_console_title:'Event Log',
+  log_light_on:'Light on',log_light_off:'Light off',log_fan:'Fan →',log_nozzle:'Nozzle →',log_bed:'Bed →',log_axis:'Axis',log_home:'Home',log_home_all:'Home All',log_cam_start:'Camera started:',log_cam_stop:'Camera stopped',log_poll_error:'Poll error:',log_error:'Error:',
+  confirm_cancel:'Really cancel the print?'
+};
+var currentLang='de';
+var T=LANG_DE;
+function toggleLang(){
+  currentLang=currentLang==='de'?'en':'de';
+  T=currentLang==='de'?LANG_DE:LANG_EN;
+  localStorage.setItem('lang',currentLang);
+  document.getElementById('lang-btn').textContent=currentLang==='de'?'EN':'DE';
+  document.documentElement.setAttribute('lang',currentLang);
+  applyLang();
+}
+function applyLang(){
+  // Nav
+  var nb=document.getElementById('nb-dashboard');if(nb)nb.querySelector('.nav-text').textContent=T.nav_dashboard;
+  nb=document.getElementById('nb-print');if(nb)nb.querySelector('.nav-text').textContent=T.nav_print;
+  nb=document.getElementById('nb-temps');if(nb)nb.querySelector('.nav-text').textContent=T.nav_temps;
+  nb=document.getElementById('nb-motion');if(nb)nb.querySelector('.nav-text').textContent=T.nav_motion;
+  nb=document.getElementById('nb-ams');if(nb)nb.querySelector('.nav-text').textContent=T.nav_ams;
+  nb=document.getElementById('nb-extras');if(nb)nb.querySelector('.nav-text').textContent=T.nav_extras;
+  nb=document.getElementById('nb-console');if(nb)nb.querySelector('.nav-text').textContent=T.nav_console;
+  // Bottom nav
+  var bnb=document.getElementById('bnb-dashboard');if(bnb)bnb.lastChild.textContent=T.nav_dashboard;
+  bnb=document.getElementById('bnb-print');if(bnb)bnb.lastChild.textContent=T.nav_print;
+  bnb=document.getElementById('bnb-motion');if(bnb)bnb.lastChild.textContent=T.nav_motion;
+  bnb=document.getElementById('bnb-extras');if(bnb)bnb.lastChild.textContent=T.nav_extras;
+  bnb=document.getElementById('bnb-console');if(bnb)bnb.lastChild.textContent=T.nav_console;
+  // Dashboard card titles
+  setText('d-card-progress',T.card_progress);
+  setText('d-card-temps',T.card_temps);
+  setText('d-card-lightfan',T.card_light_fan);
+  // Dashboard buttons
+  setText('d-btn-pause',T.btn_pause);
+  setText('d-btn-resume',T.btn_resume);
+  setText('d-btn-cancel',T.btn_cancel);
+  setText('cam-toggle-btn',camOn?T.btn_cam_stop:T.btn_cam_start);
+  setText('cam-placeholder-txt',T.cam_placeholder);
+  // Temp labels
+  document.querySelectorAll('.lbl-nozzle').forEach(e=>e.textContent=T.label_nozzle);
+  document.querySelectorAll('.lbl-bed').forEach(e=>e.textContent=T.label_bed);
+  document.querySelectorAll('.lbl-light').forEach(e=>e.textContent=T.label_light);
+  document.querySelectorAll('.lbl-fan').forEach(e=>e.textContent=T.label_fan);
+  document.querySelectorAll('.lbl-on-off').forEach(e=>e.textContent=T.label_on_off);
+  document.querySelectorAll('.lbl-speed').forEach(e=>e.textContent=T.label_speed);
+  document.querySelectorAll('.lbl-set').forEach(e=>e.textContent=T.label_set);
+  document.querySelectorAll('.lbl-off').forEach(e=>e.textContent=T.label_off);
+  document.querySelectorAll('.lbl-target-c').forEach(e=>e.textContent=T.label_target_c);
+  // Panel titles
+  setText('ptitle-print',T.panel_print_title);
+  setText('ptitle-temps-nozzle',T.panel_temps_nozzle);
+  setText('ptitle-temps-bed',T.panel_temps_bed);
+  setText('ptitle-temps-chart',T.panel_temps_chart);
+  setText('ptitle-motion-xy',T.panel_motion_xy);
+  setText('ptitle-motion-z',T.panel_motion_z);
+  setText('ptitle-ams',T.panel_ams_title);
+  setText('ptitle-extras-light',T.panel_extras_light);
+  setText('ptitle-extras-fan',T.panel_extras_fan);
+  setText('ptitle-extras-camera',T.panel_extras_camera);
+  setText('ptitle-console',T.panel_console_title);
+  // Home buttons
+  document.querySelectorAll('.lbl-home-x').forEach(e=>e.textContent=T.btn_home_x);
+  document.querySelectorAll('.lbl-home-y').forEach(e=>e.textContent=T.btn_home_y);
+  document.querySelectorAll('.lbl-home-z').forEach(e=>e.textContent=T.btn_home_z);
+  document.querySelectorAll('.lbl-home-all').forEach(e=>e.textContent=T.btn_home_all);
+  document.querySelectorAll('.lbl-step').forEach(e=>e.textContent=T.label_step);
+  // Print panel buttons
+  setText('p-btn-pause',T.panel_print_btn_pause);
+  setText('p-btn-resume',T.panel_print_btn_resume);
+  setText('p-btn-cancel',T.panel_print_btn_cancel);
+  setText('p-title-temps',T.panel_print_temps_live);
+  // Extras buttons
+  setText('e-btn-cam-start',T.btn_cam_start2);
+  setText('e-btn-cam-stop',T.btn_cam_stop2);
+}
+function setText(id,txt){var el=document.getElementById(id);if(el)el.textContent=txt;}
+(function(){
+  var l=localStorage.getItem('lang')||'de';
+  currentLang=l;T=l==='de'?LANG_DE:LANG_EN;
+  document.getElementById('lang-btn').textContent=l==='de'?'EN':'DE';
+  document.documentElement.setAttribute('lang',l);
+  // defer until DOM ready
+  window.addEventListener('DOMContentLoaded',function(){applyLang();});
+})();
+
+// ── Panel nav ──
+function showPanel(id){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-'+id).classList.add('active');
+  document.querySelectorAll('.nav-btn,.bnav-btn').forEach(b=>b.classList.remove('active'));
+  var nb=document.getElementById('nb-'+id);if(nb)nb.classList.add('active');
+  var bnb=document.getElementById('bnb-'+id);if(bnb)bnb.classList.add('active');
+  currentPanel=id;
+}
+
+// ── Console log ──
+var consoleLogs=[];
+function clog(msg,cls){
+  cls=cls||'msg-info';
+  var ts=new Date().toLocaleTimeString('de',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  consoleLogs.push({ts,msg,cls});
+  if(consoleLogs.length>100)consoleLogs.shift();
+  var el=document.getElementById('console-log');
+  el.innerHTML=consoleLogs.map(l=>`<div><span class="ts">${l.ts}</span><span class="${l.cls}">${l.msg}</span></div>`).join('');
+  el.scrollTop=el.scrollHeight;
+}
+
+// ── Helpers ──
+function fmtTime(s){if(!s||s<0)return'–';var m=Math.floor(s/60),h=Math.floor(m/60);m%=60;return h>0?h+'h '+m+'m':m+'m'}
+function post(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
+function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v))}
+
+// ── Apply state to DOM ──
+function applyState(){
+  var s=S;
+  // header
+  var b=document.getElementById('h-badge');
+  b.className='hbadge '+s.print_state;
+  document.getElementById('h-state').textContent=s.print_state.charAt(0).toUpperCase()+s.print_state.slice(1);
+  document.getElementById('h-pname').textContent=s.printer_name;
+
+  // temps
+  ['d-nt','p-nt','t-nt'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.nozzle_temp.toFixed(1)});
+  ['d-nt-t','p-nt-t','t-nt-t'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.nozzle_target.toFixed(0)});
+  ['d-bt','p-bt','t-bt'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.bed_temp.toFixed(1)});
+  ['d-bt-t','p-bt-t','t-bt-t'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.bed_target.toFixed(0)});
+
+  // SVG arcs (0..100.5 = full, offset=100.5 means empty)
+  var narc=clamp(s.nozzle_temp/300,0,1);
+  var barc=clamp(s.bed_temp/120,0,1);
+  var da=document.getElementById('d-narc');if(da)da.setAttribute('stroke-dashoffset',(100.5*(1-narc)).toFixed(1));
+  var db=document.getElementById('d-barc');if(db)db.setAttribute('stroke-dashoffset',(100.5*(1-barc)).toFixed(1));
+
+  // temp bars (temps panel)
+  var nb=document.getElementById('t-ntbar');if(nb)nb.style.width=clamp(s.nozzle_temp/300*100,0,100)+'%';
+  var bb=document.getElementById('t-btbar');if(bb)bb.style.width=clamp(s.bed_temp/120*100,0,100)+'%';
+
+  // progress
+  var pct=Math.round(s.progress*100);
+  ['d-pct','p-pct'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=pct});
+  ['d-pbar','p-pbar'].forEach(id=>{var el=document.getElementById(id);if(el)el.style.width=pct+'%'});
+
+  var layers=s.curr_layer&&s.total_layers?'L '+s.curr_layer+' / '+s.total_layers:'–';
+  ['d-layers','p-layers'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=layers});
+
+  var elapsed=fmtTime(s.print_duration);
+  ['d-elapsed','p-elapsed'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=elapsed});
+
+  var fn=s.filename||'–';
+  ['d-fname','p-fname'].forEach(id=>{var el=document.getElementById(id);if(el){el.textContent=fn;el.title=fn}});
+  var cfo=document.getElementById('cam-fname');if(cfo)cfo.textContent=fn!=='–'?fn:'';
+
+  // thumbnail
+  var thumb=document.getElementById('d-thumbnail');
+  if(thumb){
+    if(s.thumbnail){
+      thumb.src='data:image/png;base64,'+s.thumbnail;
+      thumb.style.display='block';
+    } else {
+      thumb.style.display='none';
+      thumb.src='';
+    }
+  }
+
+  // light/fan sync
+  document.getElementById('d-light-toggle').checked=s.light_on;
+  document.getElementById('e-light-toggle').checked=s.light_on;
+  ['d-fan','e-fan'].forEach(id=>{var el=document.getElementById(id);if(el)el.value=s.fan_speed});
+  ['d-fan-val','e-fan-val'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.fan_speed});
+  document.getElementById('e-fan-val').textContent=s.fan_speed;
+
+  // camera url
+  if(s.camera_url){document.getElementById('e-cam-url').textContent=s.camera_url}
+
+  // AMS
+  if(s.ams_slots&&s.ams_slots.length){
+    var html='';
+    s.ams_slots.forEach(function(slot,i){
+      var rgb=Array.isArray(slot.color)?slot.color:[128,128,128];
+      var col='rgb('+rgb[0]+','+rgb[1]+','+rgb[2]+')';
+      var active=slot.status===1||slot.active;
+      var pct=slot.consumables_percent!=null?slot.consumables_percent+'%':'–';
+      html+='<div class="ams-slot'+(active?' active':'')+ '" style="--slot-color:'+col+'">'
+        +'<div class="slot-circle" style="background:'+col+'"></div>'
+        +'<div class="slot-material">'+(slot.type||slot.material_type||'–')+'</div>'
+        +'<div class="slot-label">Slot '+(slot.index!=null?slot.index+1:i+1)+'</div>'
+        +'<div class="slot-label" style="font-size:10px;color:var(--txt2)">'+pct+'</div>'
+        +'</div>';
+    });
+    document.getElementById('ams-slots').innerHTML=html;
+  }
+
+  // camera overlay
+  var co=document.getElementById('cam-overlay');
+  if(co)co.style.display=(s.print_state==='printing'&&camOn)?'block':'none';
+
+  // auto-start camera during print
+  if(s.print_state==='printing'&&!camOn&&s.camera_url){
+    camStart();
+  }
+}
+
+// ── Temp history + chart ──
+function updateHistory(){
+  tempHistory.n.push(S.nozzle_temp);
+  tempHistory.b.push(S.bed_temp);
+  if(tempHistory.n.length>60)tempHistory.n.shift();
+  if(tempHistory.b.length>60)tempHistory.b.shift();
+  drawChart('p-chart',tempHistory,[{data:tempHistory.n,color:'#00c8ff',max:300},{data:tempHistory.b,color:'#ff6b35',max:120}]);
+  drawChart('t-chart',tempHistory,[{data:tempHistory.n,color:'#00c8ff',max:300},{data:tempHistory.b,color:'#ff6b35',max:120}]);
+}
+function drawChart(id,_,series){
+  var canvas=document.getElementById(id);if(!canvas)return;
+  var ctx=canvas.getContext('2d');
+  var W=canvas.offsetWidth*window.devicePixelRatio||canvas.width;
+  var H=canvas.offsetHeight*window.devicePixelRatio||canvas.height;
+  canvas.width=W;canvas.height=H;
+  ctx.clearRect(0,0,W,H);
+  series.forEach(function(s){
+    var data=s.data;if(!data.length)return;
+    var max=s.max;
+    ctx.beginPath();ctx.strokeStyle=s.color;ctx.lineWidth=2;ctx.lineJoin='round';
+    data.forEach(function(v,i){
+      var x=i/(Math.max(data.length-1,1))*(W-4)+2;
+      var y=H-4-(v/max)*(H-8);
+      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  });
+}
+
+// ── Poll ──
+async function poll(){
+  try{
+    var r=await fetch('/api/state');
+    if(!r.ok)return;
+    var d=await r.json();
+    Object.assign(S,d);
+    applyState();
+    updateHistory();
+  }catch(e){clog('Poll-Fehler: '+e,'msg-err')}
+}
+poll();setInterval(poll,2000);
+
+// ── Print actions ──
+function printAction(a){
+  post('/printer/print/'+a,{}).then(function(){clog('Druck: '+a,'msg-ok');poll()})
+    .catch(function(e){clog('Fehler: '+e,'msg-err')});
+}
+function confirmCancel(){if(confirm('Druck wirklich abbrechen?'))printAction('cancel')}
+
+// ── Axis motion ──
+// axis codes: 0=X, 1=Y, 2=Z
+// move_type 1=relative, distance positive/negative
+function getStep(){return currentStep}
+function setStep(btn,v){
+  currentStep=v;
+  document.querySelectorAll('.step-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('step-display').textContent=v;
+}
+function move(axis,dir,dist){
+  // axis: 0=X,1=Y,2=Z → printer axis codes: 1=X,2=Y,3=Z
+  var axisMap={0:1,1:2,2:3};
+  post('/api/axis',{axis:axisMap[axis],move_type:1,distance:dir*dist})
+    .then(function(){clog('Achse '+(axis===0?'X':axis===1?'Y':'Z')+' '+(dir>0?'+':'')+dir*dist+'mm','msg-ok')})
+    .catch(function(e){clog('Achse-Fehler: '+e,'msg-err')});
+}
+function homeAll(){
+  post('/api/axis',{axis:4,move_type:2,distance:0})
+    .then(function(){clog('Home All','msg-ok')})
+    .catch(function(e){clog('Home-Fehler: '+e,'msg-err')});
+}
+function homeAxis(ax){
+  var m={X:1,Y:2,Z:3};
+  post('/api/axis',{axis:m[ax],move_type:2,distance:0})
+    .then(function(){clog('Home '+ax,'msg-ok')})
+    .catch(function(e){clog('Home-Fehler: '+e,'msg-err')});
+}
+
+// ── Temperature ──
+function setNozzle(){
+  var v=parseFloat(document.getElementById('p-nozzle-inp').value||0);
+  post('/api/temperature',{nozzle:v,bed:S.bed_target})
+    .then(function(){clog('Nozzle → '+v+'°C','msg-ok')})
+    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
+}
+function setBed(){
+  var v=parseFloat(document.getElementById('p-bed-inp').value||0);
+  post('/api/temperature',{nozzle:S.nozzle_target,bed:v})
+    .then(function(){clog('Bett → '+v+'°C','msg-ok')})
+    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
+}
+function setNozzle2(){
+  var v=parseFloat(document.getElementById('t-nozzle-inp').value||0);
+  post('/api/temperature',{nozzle:v,bed:S.bed_target})
+    .then(function(){clog('Nozzle → '+v+'°C','msg-ok')})
+    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
+}
+function setBed2(){
+  var v=parseFloat(document.getElementById('t-bed-inp').value||0);
+  post('/api/temperature',{nozzle:S.nozzle_target,bed:v})
+    .then(function(){clog('Bett → '+v+'°C','msg-ok')})
+    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
+}
+
+// ── Light ──
+function setLight(){
+  var on=document.getElementById('d-light-toggle').checked;
+  post('/api/light',{on:on,brightness:80})
+    .then(function(){clog('Licht '+(on?'an, '+br+'%':'aus'),'msg-ok')})
+    .catch(function(e){clog('Licht-Fehler: '+e,'msg-err')});
+}
+function setLight2(){
+  var on=document.getElementById('e-light-toggle').checked;
+  post('/api/light',{on:on,brightness:80})
+    .then(function(){clog('Licht '+(on?'an, '+br+'%':'aus'),'msg-ok')})
+    .catch(function(e){clog('Licht-Fehler: '+e,'msg-err')});
+}
+
+// ── Fan ──
+function setFan(){
+  var v=parseInt(document.getElementById('d-fan').value);
+  document.getElementById('d-fan-val').textContent=v;
+  post('/api/fan',{speed:v})
+    .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
+    .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
+}
+function setFan2(){
+  var v=parseInt(document.getElementById('e-fan').value);
+  post('/api/fan',{speed:v})
+    .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
+    .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
+}
+function quickFan(v){
+  document.getElementById('e-fan').value=v;
+  document.getElementById('e-fan-val').textContent=v;
+  post('/api/fan',{speed:v})
+    .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
+    .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
+}
+
+// ── AMS ──
+function amsFeed(type){
+  var slot=parseInt(document.getElementById('ams-slot-sel').value);
+  post('/api/ams/feed',{slot_index:slot,type:type})
+    .then(function(){clog((type===1?'Einziehen':'Ausziehen')+' Slot '+(slot+1),'msg-ok')})
+    .catch(function(e){clog('AMS-Fehler: '+e,'msg-err')});
+}
+
+// ── Camera ──
+function camStart(){
+  var img=document.getElementById('cam-img');
+  var ph=document.getElementById('cam-placeholder');
+  var sp=document.getElementById('cam-spinner');
+  ph.style.display='none';
+  img.style.display='none';
+  sp.style.display='block';
+  post('/api/camera/start',{}).then(function(){
+    return new Promise(function(res){setTimeout(res,800)});
+  }).then(function(){
+    img.onload=function(){
+      sp.style.display='none';
+      img.style.display='block';
+    };
+    img.onerror=function(){
+      sp.style.display='none';
+      ph.style.display='flex';
+      clog((T.log_error||'Fehler:')+' Stream nicht verfügbar','msg-err');
+    };
+    img.src='/api/camera/stream?t='+Date.now();
+    camOn=true;
+    document.getElementById('cam-toggle-btn').textContent=T.btn_cam_stop||'◼ Kamera';
+    clog((T.log_cam_start||'Kamera gestartet'),'msg-ok');
+  }).catch(function(e){
+    sp.style.display='none';
+    ph.style.display='flex';
+    clog((T.log_error||'Fehler:')+' '+e,'msg-err');
+  });
+}
+function camStop(){
+  post('/api/camera/stop',{}).then(function(){
+    var img=document.getElementById('cam-img');
+    img.src='';
+    img.style.display='none';
+    document.getElementById('cam-spinner').style.display='none';
+    document.getElementById('cam-placeholder').style.display='flex';
+    camOn=false;
+    document.getElementById('cam-toggle-btn').textContent=T.btn_cam_start||'▶ Kamera';
+    clog(T.log_cam_stop||'Kamera gestoppt','msg-ok');
+  }).catch(function(e){clog((T.log_error||'Fehler:')+' '+e,'msg-err')});
+}
+function toggleCam(){if(camOn)camStop();else camStart()}
+</script>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+    async def handle_api_light(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        on         = bool(body.get("on", True))
+        brightness = int(body.get("brightness", self._state["light_brightness"]))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: self.client.publish(
+            "light", "control",
+            {"type": 3, "status": 1 if on else 0, "brightness": brightness},
+            timeout=0
+        ))
+        self._state["light_on"]         = on
+        self._state["light_brightness"] = brightness
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_fan(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        speed = int(body.get("speed", 0))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: self.client.publish(
+            "fan", "setSpeed", {"fan_speed_pct": speed}, timeout=0
+        ))
+        self._state["fan_speed"] = speed
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_ams_feed(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        slot_index = int(body.get("slot_index", 0))
+        feed_type  = int(body.get("type", 1))
+        # Ausziehen (type=2): wenn kein Slot explizit gewählt, den zuletzt geladenen nehmen
+        if feed_type == 2 and self._ams_loaded_slot >= 0:
+            slot_index = self._ams_loaded_slot
+        loop = asyncio.get_event_loop()
+        def _send():
+            resp = self.client.publish(
+                "multiColorBox", "feedFilament",
+                {"multi_color_box": [{"id": -1, "feed_status": {"slot_index": slot_index, "type": feed_type}}]},
+                timeout=5
+            )
+            log.info(f"feedFilament type={feed_type} slot={slot_index} loaded_slot={self._ams_loaded_slot} → {resp}")
+        await loop.run_in_executor(None, _send)
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_axis(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        axis      = int(body.get("axis", 4))
+        move_type = int(body.get("move_type", 2))
+        distance  = float(body.get("distance", 0))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: self.client.publish(
+            "axis", "move",
+            {"axis": axis, "move_type": move_type, "distance": distance},
+            timeout=0
+        ))
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_temperature(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        nozzle = body.get("nozzle")
+        bed    = body.get("bed")
+        loop = asyncio.get_event_loop()
+        if nozzle is not None:
+            n = int(float(nozzle))
+            await loop.run_in_executor(None, lambda: self.client.publish(
+                "tempature", "set",
+                {"type": 0, "target_nozzle_temp": n, "target_hotbed_temp": 0},
+                timeout=0
+            ))
+        if bed is not None:
+            b = int(float(bed))
+            await loop.run_in_executor(None, lambda: self.client.publish(
+                "tempature", "set",
+                {"type": 1, "target_hotbed_temp": b, "target_nozzle_temp": 0},
+                timeout=0
+            ))
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_camera(self, request):
+        return web.json_response({"url": self._state["camera_url"]})
+
+    async def handle_api_camera_start(self, request):
+        loop = asyncio.get_event_loop()
+        # Wait for pushStarted confirmation before returning
+        result = await loop.run_in_executor(None, lambda: self.client.publish(
+            "video", "startCapture", None, timeout=8.0
+        ))
+        state = (result or {}).get("state", "")
+        log.info(f"Kamera startCapture: state={state}")
+        return web.json_response({"result": "ok", "state": state})
+
+    async def handle_api_camera_stop(self, request):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: self.client.publish(
+            "video", "stopCapture", None, timeout=0
+        ))
+        return web.json_response({"result": "ok"})
+
+    async def handle_camera_stream(self, request):
+        """MJPEG proxy: FLV → MJPEG via ffmpeg, served as multipart/x-mixed-replace."""
+        url = self._state.get("camera_url", "")
+        if not url:
+            return web.Response(status=503, text="Keine Kamera-URL bekannt")
+
+        boundary = "kobraxframe"
+        resp = web.StreamResponse(headers={
+            "Content-Type": f"multipart/x-mixed-replace;boundary={boundary}",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        })
+        await resp.prepare(request)
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "quiet",
+            "-i", url,
+            "-vf", "fps=10,scale=640:-1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-q:v", "5",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        buf = b""
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                # Extract complete JPEG frames (SOI=FFD8, EOI=FFD9)
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    if start == -1:
+                        buf = b""
+                        break
+                    end = buf.find(b"\xff\xd9", start + 2)
+                    if end == -1:
+                        buf = buf[start:]
+                        break
+                    frame = buf[start:end + 2]
+                    buf = buf[end + 2:]
+                    header = (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(frame)}\r\n\r\n"
+                    ).encode()
+                    try:
+                        await resp.write(header + frame + b"\r\n")
+                    except Exception:
+                        return resp
+        except Exception as e:
+            log.warning(f"Kamera-Stream unterbrochen: {e}")
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        return resp
+
+    async def handle_serve_file(self, request):
+        """Liefert hochgeladene G-Code-Dateien vom Temp-Verzeichnis (für Drucker-Download)."""
+        filename = os.path.basename(request.match_info.get("filename", ""))
+        serve_path = os.path.join(self._serve_dir_path, filename)
+        if not os.path.isfile(serve_path):
+            return web.Response(status=404, text="not found")
+        size = os.path.getsize(serve_path)
+        log.info(f"Drucker lädt Datei ab: {filename} ({size} bytes)")
+        return web.FileResponse(serve_path, headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        })
+
+    async def handle_api_state(self, request):
+        s = self._state
+        return web.json_response({
+            "printer_name":     s["printer_name"],
+            "firmware_version": s["firmware_version"],
+            "print_state":      s["print_state"],
+            "nozzle_temp":      s["nozzle_temp"],
+            "nozzle_target":    s["nozzle_target"],
+            "bed_temp":         s["bed_temp"],
+            "bed_target":       s["bed_target"],
+            "progress":         s["progress"],
+            "print_duration":   s["print_duration"],
+            "curr_layer":       s["curr_layer"],
+            "total_layers":     s["total_layers"],
+            "filename":         s["filename"],
+            "camera_url":       s["camera_url"],
+            "fan_speed":        s["fan_speed"],
+            "light_on":         s["light_on"],
+            "light_brightness": s["light_brightness"],
+            "ams_slots":        self._ams_slots,
+            "ams_loaded_slot":  self._ams_loaded_slot,
+            "thumbnail":        self._thumbnail_b64,
+        })
+
+    async def handle_moonraker_database(self, request):
+        """OrcaSlicer 'Synchronize filament list from AMS' liest /server/database/item?namespace=lane_data"""
+        namespace = request.rel_url.query.get("namespace", "")
+        if namespace != "lane_data":
+            return web.json_response({"result": {"namespace": namespace, "value": {}}})
+        loop = asyncio.get_event_loop()
+        slots = await loop.run_in_executor(None, lambda: self._get_ams_slots_fresh())
+        lane_data = {}
+        for i, slot in enumerate(slots):
+            rgb = slot.get("color", [128, 128, 128])
+            if isinstance(rgb, list) and len(rgb) >= 3:
+                alpha = rgb[3] if len(rgb) == 4 else 255
+                color_hex = f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}{alpha:02X}"
+            else:
+                color_hex = "808080FF"
+            material = slot.get("type", "")
+            default_temps = {
+                "PLA":  {"nozzle": 220, "bed": 60},
+                "PETG": {"nozzle": 240, "bed": 70},
+                "ABS":  {"nozzle": 250, "bed": 100},
+                "TPU":  {"nozzle": 230, "bed": 40},
+            }
+            temps = default_temps.get(material.upper(), {"nozzle": 220, "bed": 60})
+            lane_data[f"lane{i}"] = {
+                "vendor_name": "Anycubic",
+                "name":        material,
+                "color":       color_hex,
+                "material":    material,
+                "bed_temp":    temps["bed"],
+                "nozzle_temp": temps["nozzle"],
+                "scan_time":   None,
+                "td":          None,
+                "lane":        str(i),
+                "spool_id":    None,
+                "filament_id": None,
+            }
+        log.info(f"AMS-Sync: {len(lane_data)} Slots an OrcaSlicer")
+        return web.json_response({"result": {"namespace": "lane_data", "value": lane_data}})
+
+    def _get_ams_slots_fresh(self):
+        """Frische Slot-Daten per getInfo holen, Fallback auf gecachte."""
+        resp = self.client.publish("multiColorBox", "getInfo", None, timeout=5)
+        if resp and resp.get("data"):
+            boxes = resp["data"].get("multi_color_box") or []
+            if boxes:
+                slots = boxes[0].get("slots") or []
+                if slots:
+                    self._ams_slots = slots
+        return self._ams_slots
+
+    async def handle_catchall(self, request):
+        body = await request.read()
+        log.warning(f"UNBEKANNT {request.method} {request.path_qs}  body={body[:200]}")
+        return web.json_response({"result": {}}, status=200)
+
+    async def handle_favicon(self, request):
+        # Minimales 1x1 ICO damit der Browser nicht 404 loggt
+        ico = bytes([
+            0,0,1,0,1,0,1,1,0,0,1,0,24,0,40,0,0,0,22,0,0,0,40,0,0,0,
+            1,0,0,0,2,0,0,0,1,0,24,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,255,102,0,0,0,0,0,0
+        ])
+        return web.Response(body=ico, content_type="image/x-icon")
+
+    # -------------------------------------------------------------------------
+    # WebSocket handler
+    # -------------------------------------------------------------------------
+
+    async def handle_websocket(self, request):
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        ws._loop = asyncio.get_event_loop()
+        self.ws_clients.add(ws)
+        log.info(f"WS client verbunden ({len(self.ws_clients)} gesamt)")
+
+        # Send klippy_ready notification
+        await ws.send_str(json.dumps({
+            "jsonrpc": "2.0",
+            "method":  "notify_klippy_ready",
+            "params":  [],
+        }))
+        # Send initial status
+        await ws.send_str(json.dumps({
+            "jsonrpc": "2.0",
+            "method":  "notify_status_update",
+            "params":  [self._build_printer_objects(), time.time()],
+        }))
+
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                await self._handle_ws_rpc(ws, msg.data)
+            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                break
+
+        self.ws_clients.discard(ws)
+        log.info(f"WS client getrennt ({len(self.ws_clients)} verbleibend)")
+        return ws
+
+    async def _handle_ws_rpc(self, ws: web.WebSocketResponse, raw: str):
+        try:
+            req = json.loads(raw)
+        except Exception:
+            return
+        rpc_id = req.get("id")
+        method  = req.get("method", "")
+        log.info(f"WS RPC: {method}  params={str(req.get('params',''))[:120]}")
+        params  = req.get("params") or {}
+        if isinstance(params, list):
+            params = params[0] if params else {}
+
+        result = None
+        error  = None
+
+        try:
+            if method in ("printer.info", "printer_info"):
+                result = {
+                    "state":           "ready",
+                    "state_message":   "Printer is ready",
+                    "hostname":        "kobrax-bridge",
+                    "software_version": KLIPPER_VERSION,
+                    "cpu_info":        self._state["printer_name"],
+                    "klipper_path":    "/home/pi/klipper",
+                    "python_path":     "/home/pi/klippy-env/bin/python",
+                }
+            elif method in ("server.info", "server_info"):
+                result = {
+                    "klippy_connected": True,
+                    "klippy_state":     "ready",
+                    "moonraker_version": MOONRAKER_VERSION,
+                    "components":       [],
+                    "failed_components": [],
+                    "registered_directories": ["gcodes"],
+                    "warnings":         [],
+                }
+            elif method in ("printer.objects.list",):
+                result = {"objects": list(self._build_printer_objects().keys())}
+            elif method in ("printer.objects.query", "printer.objects.get"):
+                objects = params.get("objects", {})
+                all_objs = self._build_printer_objects()
+                if objects:
+                    filtered = {k: all_objs.get(k, {}) for k in objects}
+                else:
+                    filtered = all_objs
+                result = {"status": filtered, "eventtime": time.time()}
+            elif method == "printer.objects.subscribe":
+                objects = params.get("objects", {})
+                all_objs = self._build_printer_objects()
+                if objects:
+                    filtered = {k: all_objs.get(k, {}) for k in objects}
+                else:
+                    filtered = all_objs
+                result = {"status": filtered, "eventtime": time.time()}
+            elif method == "printer.print.start":
+                filename = params.get("filename", self._last_uploaded_file)
+                loop = asyncio.get_event_loop()
+                resp = await loop.run_in_executor(
+                    None, lambda: self.client.publish("print", "start",
+                        {"filename": filename, "use_ams": False}, timeout=15.0)
+                )
+                result = "ok" if resp else "timeout"
+            elif method == "printer.print.pause":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.client.pause_print)
+                result = "ok"
+            elif method == "printer.print.resume":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.client.resume_print)
+                result = "ok"
+            elif method == "printer.print.cancel":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.client.stop_print)
+                result = "ok"
+            elif method == "machine.system_info":
+                result = {"system_info": {"cpu_info": {"cpu_desc": "Kobra X Bridge"}}}
+            elif method == "server.files.list":
+                result = []
+            else:
+                log.debug(f"Unbekannte RPC-Methode: {method}")
+                result = {}
+        except Exception as e:
+            log.error(f"RPC-Fehler für {method}: {e}")
+            error = {"code": -32603, "message": str(e)}
+
+        if rpc_id is not None:
+            response = {"jsonrpc": "2.0", "id": rpc_id}
+            if error:
+                response["error"] = error
+            else:
+                response["result"] = result
+            await ws.send_str(json.dumps(response))
+
+    # -------------------------------------------------------------------------
+    # Poll loop (sync, runs in executor)
+    # -------------------------------------------------------------------------
+
+    def _poll_loop(self, stop_event: threading.Event):
+        while not stop_event.is_set():
+            try:
+                info = self.client.query_info()
+                if info:
+                    self._on_info(info)
+                # Während Druck: print/report direkt abfragen
+                if self._state["print_state"] in ("printing", "preheating",
+                                                   "auto_leveling", "checking", "init"):
+                    print_r = self.client.publish("print", "query", timeout=3.0)
+                    if print_r:
+                        self._on_print(print_r)
+                box = self.client.query_multicolor_box()
+                if box:
+                    boxes = (box.get("data") or {}).get("multi_color_box") or []
+                    slots = boxes[0].get("slots") or [] if boxes else []
+                    if slots:
+                        self._ams_slots = slots
+            except Exception as e:
+                log.warning(f"Poll-Fehler: {e}")
+            stop_event.wait(3.0)
+
+
+# ---------------------------------------------------------------------------
+# App factory + main
+# ---------------------------------------------------------------------------
+
+def build_app(bridge: KobraXBridge) -> web.Application:
+    app = web.Application()
+    r = app.router
+
+    # Moonraker API
+    r.add_get("/server/info",                bridge.handle_server_info)
+    r.add_get("/printer/info",               bridge.handle_printer_info)
+    r.add_get("/machine/system_info",        bridge.handle_machine_system_info)
+    r.add_get("/printer/objects/list",       bridge.handle_objects_list)
+    r.add_get("/printer/objects/query",      bridge.handle_objects_query)
+    r.add_get("/printer/objects/subscribe",  bridge.handle_objects_subscribe)
+    r.add_post("/printer/objects/subscribe", bridge.handle_objects_subscribe)
+    r.add_get("/server/files/list",          bridge.handle_files_list)
+    r.add_post("/server/files/upload",       bridge.handle_file_upload)
+    r.add_post("/printer/print/start",       bridge.handle_print_start)
+    r.add_post("/printer/print/pause",       bridge.handle_print_pause)
+    r.add_post("/printer/print/resume",      bridge.handle_print_resume)
+    r.add_post("/printer/print/cancel",      bridge.handle_print_cancel)
+
+    # OctoPrint compatibility (OrcaSlicer probes this + uploads here)
+    r.add_get("/api/version",                bridge.handle_octoprint_version)
+    r.add_post("/api/files/local",           bridge.handle_file_upload)
+    r.add_post("/api/files/{path:.*}",       bridge.handle_file_upload)
+
+    # Moonraker database (OrcaSlicer AMS-Sync)
+    r.add_get("/server/database/item",       bridge.handle_moonraker_database)
+
+    # New API endpoints
+    r.add_post("/api/light",               bridge.handle_api_light)
+    r.add_post("/api/fan",                 bridge.handle_api_fan)
+    r.add_post("/api/ams/feed",            bridge.handle_api_ams_feed)
+    r.add_post("/api/axis",                bridge.handle_api_axis)
+    r.add_post("/api/temperature",         bridge.handle_api_temperature)
+    r.add_get("/api/camera",               bridge.handle_api_camera)
+    r.add_get("/api/camera/stream",        bridge.handle_camera_stream)
+    r.add_post("/api/camera/start",        bridge.handle_api_camera_start)
+    r.add_post("/api/camera/stop",         bridge.handle_api_camera_stop)
+    r.add_get("/api/state",                bridge.handle_api_state)
+    r.add_get("/serve/{filename}",         bridge.handle_serve_file)
+
+    # Root + favicon (OrcaSlicer öffnet / in eingebettetem Browser)
+    r.add_get("/",                           bridge.handle_index)
+    r.add_get("/favicon.ico",               bridge.handle_favicon)
+
+    # WebSocket
+    r.add_get("/websocket",                  bridge.handle_websocket)
+
+    # Catch-all: alle unbekannten Requests loggen statt 404
+    r.add_route("*", "/{path:.*}",           bridge.handle_catchall)
+
+    return app
+
+
+async def run_bridge(args):
+    log.info(f"Verbinde mit Drucker {args.printer_ip}:{args.mqtt_port} …")
+    client = KobraXClient(
+        host=args.printer_ip,
+        port=args.mqtt_port,
+        username=args.username,
+        password=args.password,
+        mode_id=args.mode_id,
+        device_id=args.device_id,
+        client_id="kobrax_bridge",
+    )
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, client.connect)
+    log.info("MQTT verbunden")
+
+    bridge  = KobraXBridge(client)
+    app     = build_app(bridge)
+
+    stop_event = threading.Event()
+    poll_thread = threading.Thread(
+        target=bridge._poll_loop, args=(stop_event,), daemon=True, name="poll"
+    )
+    poll_thread.start()
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, args.host, args.port)
+    await site.start()
+
+    log.info(f"Bridge läuft auf http://{args.host}:{args.port}")
+    log.info(f"OrcaSlicer → Klipper → Host: {args.host}  Port: {args.port}")
+    log.info("Ctrl-C zum Beenden")
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        stop_event.set()
+        await runner.cleanup()
+        client.disconnect()
+        log.info("Bridge beendet")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Moonraker-Bridge für Anycubic Kobra X")
+    parser.add_argument("--printer-ip",  default=env_loader.PRINTER_IP,
+                        help="IP-Adresse des Druckers")
+    parser.add_argument("--mqtt-port",   type=int, default=env_loader.MQTT_PORT)
+    parser.add_argument("--username",    default=env_loader.USERNAME)
+    parser.add_argument("--password",    default=env_loader.PASSWORD)
+    parser.add_argument("--mode-id",     default=env_loader.MODE_ID)
+    parser.add_argument("--device-id",   default=env_loader.DEVICE_ID)
+    parser.add_argument("--host",        default="0.0.0.0",
+                        help="Bind-Adresse für den Bridge-Server")
+    parser.add_argument("--port",        type=int, default=7125,
+                        help="HTTP/WS-Port (Moonraker-Standard: 7125)")
+    args = parser.parse_args()
+
+    asyncio.run(run_bridge(args))
+
+
+if __name__ == "__main__":
+    main()
