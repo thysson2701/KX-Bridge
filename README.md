@@ -172,8 +172,6 @@ sudo usermod -aG docker $USER
 
 ## Sicherheitshinweise
 
-- Die Bridge bindet auf Port 7125 – nur im lokalen Netzwerk betreiben
-- `.env` enthält Drucker-Zugangsdaten – nicht teilen oder ins Repo committen
 - Alle Zugangsdaten werden ausschließlich lokal verarbeitet
 
 ---
