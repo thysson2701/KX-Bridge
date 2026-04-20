@@ -1,0 +1,13 @@
+services:
+  kx-bridge:
+    image: kx-bridge:latest
+    build: .
+    env_file: .env
+    ports:
+      - "7125:7125"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
