@@ -83,6 +83,7 @@ class KobraXBridge:
             "light_on":           False,
             "light_brightness":   80,
             "taskid":             "-1",
+            "print_speed_mode":   2,
         }
         self._ams_slots: list[dict] = []
         self._ams_loaded_slot: int = -1
@@ -128,6 +129,9 @@ class KobraXBridge:
             self._state["total_layers"] = d["total_layers"]
         if "taskid" in d:
             self._state["taskid"] = str(d["taskid"])
+        settings = d.get("settings") or {}
+        if "print_speed_mode" in settings:
+            self._state["print_speed_mode"] = int(settings["print_speed_mode"])
         self._push_status_update()
 
     def _on_info(self, payload: dict):
@@ -152,6 +156,9 @@ class KobraXBridge:
         fan = d.get("fan_speed_pct")
         if fan is not None:
             self._state["fan_speed"] = int(fan)
+        speed_mode = d.get("print_speed_mode")
+        if speed_mode is not None:
+            self._state["print_speed_mode"] = int(speed_mode)
         self._push_status_update()
 
     def _on_file(self, payload: dict):
@@ -637,6 +644,14 @@ main{flex:1;overflow-y:auto;padding:20px}
 .btn-cancel{background:#2d0d0d;color:var(--err);border:1px solid var(--err)}
 .btn-accent{background:var(--accent);color:#001a24}
 .btn-sm{padding:7px 12px;font-size:12px}
+.spd-btn{flex:1;border:1.5px solid var(--border);background:var(--raised);color:var(--txt);
+  border-radius:10px;padding:14px 8px;font-size:13px;font-weight:600;cursor:pointer;
+  transition:all .15s;display:flex;flex-direction:column;align-items:center;gap:4px}
+.spd-btn:hover{border-color:var(--accent);color:var(--accent)}
+.spd-btn.spd-active{border-color:var(--accent);background:rgba(0,200,255,.12);color:var(--accent)}
+.spd-btn .spd-icon{font-size:22px}
+.spd-bar{height:4px;border-radius:2px;background:var(--border);margin-top:10px;overflow:hidden}
+.spd-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent2),var(--accent));transition:width .3s}
 
 /* ── TEMPS ── */
 .temp-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -887,9 +902,9 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
         <!-- Kamera -->
         <div class="card" style="grid-column:1/-1">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-            <div class="card-title" style="margin-bottom:0"><span>📷</span> Kamera</div>
+            <div class="card-title" style="margin-bottom:0"><span>📷</span> <span id="d-card-cam">Kamera</span></div>
             <div style="display:flex;align-items:center;gap:10px">
-              <span style="font-size:12px;color:var(--txt2)">💡 Licht</span>
+              <span id="d-lbl-light" style="font-size:12px;color:var(--txt2)">💡 Licht</span>
               <label class="toggle">
                 <input type="checkbox" id="d-light-toggle" onchange="setLight()">
                 <span class="toggle-track"></span>
@@ -947,7 +962,7 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
               </div>
             </div>
             <div class="temp-block">
-              <div class="temp-label">Bett</div>
+              <div class="temp-label" id="d-lbl-bed">Bett</div>
               <div class="temp-row">
                 <div class="temp-val" id="d-bt">–</div>
                 <div class="temp-unit">°C</div>
@@ -1005,6 +1020,28 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
           <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--txt2)">Schrittweite: <span id="step-display">1</span> mm</div>
         </div>
 
+        <!-- Print Speed -->
+        <div class="card">
+          <div class="card-title"><span>🏎</span> <span id="d-card-speed">Druckgeschwindigkeit</span></div>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button class="spd-btn" id="d-spd-1" onclick="setSpeed(1)">
+              <span class="spd-icon">🐢</span>
+              <span id="d-spd-lbl-1">Leise</span>
+            </button>
+            <button class="spd-btn spd-active" id="d-spd-2" onclick="setSpeed(2)">
+              <span class="spd-icon">⚡</span>
+              <span id="d-spd-lbl-2">Normal</span>
+            </button>
+            <button class="spd-btn" id="d-spd-3" onclick="setSpeed(3)">
+              <span class="spd-icon">🚀</span>
+              <span id="d-spd-lbl-3">Sport</span>
+            </button>
+          </div>
+          <div class="spd-bar" style="margin-top:12px">
+            <div class="spd-bar-fill" id="d-spd-bar" style="width:50%"></div>
+          </div>
+        </div>
+
         <!-- Lüfter -->
         <div class="card">
           <div class="card-title"><span>🌀</span> <span id="d-card-lightfan">Lüfter</span></div>
@@ -1036,8 +1073,8 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
               <span id="ams-slot-label" style="min-width:48px;font-size:13px;font-weight:600">Slot 1</span>
             </div>
             <div style="display:flex;gap:10px">
-              <button class="btn" style="flex:1" onclick="amsFeed(1)">⬇ Einziehen</button>
-              <button id="btn-unload" class="btn" style="flex:1" onclick="amsFeed(2)">⬆ Ausziehen</button>
+              <button class="btn" style="flex:1" onclick="amsFeed(1)">⬇ <span class="lbl-feed">Einziehen</span></button>
+              <button id="btn-unload" class="btn" style="flex:1" onclick="amsFeed(2)">⬆ <span class="lbl-unload">Ausziehen</span></button>
             </div>
           </div>
         </div>
@@ -1064,7 +1101,7 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
 var S={nozzle_temp:0,nozzle_target:0,bed_temp:0,bed_target:0,
   print_state:'standby',filename:'',progress:0,print_duration:0,
   curr_layer:0,total_layers:0,printer_name:'Kobra X',firmware_version:'–',
-  camera_url:'',fan_speed:0,light_on:false,light_brightness:80,ams_slots:[]};
+  camera_url:'',fan_speed:0,print_speed_mode:2,light_on:false,light_brightness:80,ams_slots:[]};
 var tempHistory={n:[],b:[]};
 var camOn=false;
 var currentStep=1;
@@ -1083,7 +1120,9 @@ var LANG_DE={
   header_status_standby:'Bereit',header_status_printing:'Druckt',header_status_complete:'Fertig',header_status_error:'Fehler',
   kobra_free:'Bereit',kobra_busy:'Beschäftigt',kobra_printing:'Druckt',kobra_preheating:'Aufheizen',kobra_auto_leveling:'Nivellierung',kobra_checking:'Prüfung',kobra_updated:'Aktualisierung',kobra_init:'Initialisierung',kobra_finished:'Abgeschlossen',kobra_failed:'Fehler',kobra_canceled:'Abgebrochen',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Druck',nav_temps:'Temperaturen',nav_motion:'Achsen',nav_ams:'AMS',nav_extras:'Licht / Lüfter',nav_console:'Konsole',
-  card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Lüfter',
+  card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Lüfter',card_speed:'Druckgeschwindigkeit',card_cam:'Kamera',
+  speed_silent:'🐢 Leise',speed_normal:'⚡ Normal',speed_sport:'🚀 Sport',
+  lbl_light:'💡 Licht',lbl_feed:'Einziehen',lbl_unload:'Ausziehen',
   cam_placeholder:'📷 Kamera nicht gestartet',btn_cam_start:'▶ Kamera',btn_cam_stop:'◼ Kamera',
   btn_pause:'⏸ Pause',btn_resume:'▶ Weiter',btn_cancel:'✕ Stopp',
   label_nozzle:'Nozzle',label_bed:'Bett',label_fan:'🌀 Lüfter',label_light:'💡 Licht',label_on_off:'Ein / Aus',label_speed:'Geschwindigkeit',
@@ -1106,7 +1145,9 @@ var LANG_EN={
   header_status_standby:'Ready',header_status_printing:'Printing',header_status_complete:'Complete',header_status_error:'Error',
   kobra_free:'Ready',kobra_busy:'Busy',kobra_printing:'Printing',kobra_preheating:'Preheating',kobra_auto_leveling:'Auto Leveling',kobra_checking:'Checking',kobra_updated:'Updating',kobra_init:'Initializing',kobra_finished:'Finished',kobra_failed:'Error',kobra_canceled:'Cancelled',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Print',nav_temps:'Temperatures',nav_motion:'Motion',nav_ams:'AMS',nav_extras:'Light / Fan',nav_console:'Console',
-  card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Fan',
+  card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Fan',card_speed:'Print Speed',card_cam:'Camera',
+  speed_silent:'🐢 Silent',speed_normal:'⚡ Normal',speed_sport:'🚀 Sport',
+  lbl_light:'💡 Light',lbl_feed:'Load',lbl_unload:'Unload',
   cam_placeholder:'📷 Camera not started',btn_cam_start:'▶ Camera',btn_cam_stop:'◼ Camera',
   btn_pause:'⏸ Pause',btn_resume:'▶ Resume',btn_cancel:'✕ Stop',
   label_nozzle:'Nozzle',label_bed:'Bed',label_fan:'🌀 Fan',label_light:'💡 Light',label_on_off:'On / Off',label_speed:'Speed',
@@ -1146,7 +1187,11 @@ function applyLang(){
   setText('d-card-progress',T.card_progress);
   setText('d-card-temps',T.card_temps);
   setText('d-card-lightfan',T.card_light_fan);
+  setText('d-card-speed',T.card_speed);
+  setText('d-card-cam',T.card_cam);
   setText('d-card-ams',T.panel_ams_title);
+  setText('d-lbl-light',T.lbl_light);
+  setText('d-lbl-bed',T.label_bed);
   // Dashboard buttons
   setText('d-btn-pause',T.btn_pause);
   setText('d-btn-resume',T.btn_resume);
@@ -1181,6 +1226,13 @@ function applyLang(){
   setText('lbl-mode-id',T.settings_mode_id);
   setText('lbl-update-check',T.update_check);
   setText('lbl-update-apply',T.update_apply);
+  // Speed buttons
+  setText('d-spd-lbl-1',T.speed_silent.replace(/^\S+\s/,''));
+  setText('d-spd-lbl-2',T.speed_normal.replace(/^\S+\s/,''));
+  setText('d-spd-lbl-3',T.speed_sport.replace(/^\S+\s/,''));
+  // AMS feed/unload
+  document.querySelectorAll('.lbl-feed').forEach(e=>e.textContent=T.lbl_feed);
+  document.querySelectorAll('.lbl-unload').forEach(e=>e.textContent=T.lbl_unload);
 }
 function setText(id,txt){var el=document.getElementById(id);if(el)el.textContent=txt;}
 (function(){
@@ -1270,6 +1322,15 @@ function applyState(){
   document.getElementById('d-light-toggle').checked=s.light_on;
   var dfan=document.getElementById('d-fan');if(dfan)dfan.value=s.fan_speed;
   var dfanval=document.getElementById('d-fan-val');if(dfanval)dfanval.textContent=s.fan_speed;
+
+  // speed mode buttons
+  var spdWidths={1:25,2:55,3:90};
+  [1,2,3].forEach(function(m){
+    var b=document.getElementById('d-spd-'+m);
+    if(b) b.classList.toggle('spd-active', s.print_speed_mode===m);
+  });
+  var spdBar=document.getElementById('d-spd-bar');
+  if(spdBar) spdBar.style.width=(spdWidths[s.print_speed_mode]||55)+'%';
 
   // AMS
   if(s.ams_slots&&s.ams_slots.length){
@@ -1478,7 +1539,7 @@ function setNozzle(){
 function setBed(){
   var v=parseFloat(document.getElementById('p-bed-inp').value||0);
   post('/api/temperature',{nozzle:S.nozzle_target,bed:v})
-    .then(function(){clog('Bett → '+v+'°C','msg-ok')})
+    .then(function(){clog(T.label_bed+' → '+v+'°C','msg-ok')})
     .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
 }
 
@@ -1488,6 +1549,17 @@ function setLight(){
   post('/api/light',{on:on,brightness:80})
     .then(function(){clog('Licht '+(on?'an, '+br+'%':'aus'),'msg-ok')})
     .catch(function(e){clog('Licht-Fehler: '+e,'msg-err')});
+}
+
+// ── Print Speed ──
+function setSpeed(mode){
+  S.print_speed_mode=mode;
+  [1,2,3].forEach(function(m){
+    var b=document.getElementById('d-spd-'+m);
+    if(b) b.classList.toggle('spd-active',m===mode);
+  });
+  post('/api/speed',{mode:mode})
+    .catch(function(e){clog('Speed-Fehler: '+e,'msg-err')});
 }
 
 // ── Fan ──
@@ -1510,7 +1582,7 @@ function quickFan(v){
 function amsFeed(type){
   var slot=parseInt(document.getElementById('ams-slot-sel').value);
   post('/api/ams/feed',{slot_index:slot,type:type})
-    .then(function(){clog((type===1?'Einziehen':'Ausziehen')+' Slot '+(slot+1),'msg-ok')})
+    .then(function(){clog((type===1?T.lbl_feed:T.lbl_unload)+' Slot '+(slot+1),'msg-ok')})
     .catch(function(e){clog('AMS-Fehler: '+e,'msg-err')});
 }
 
@@ -1598,6 +1670,21 @@ function toggleCam(){if(camOn)camStop();else camStart()}
             "fan", "setSpeed", {"fan_speed_pct": speed}, timeout=0
         ))
         self._state["fan_speed"] = speed
+        return web.json_response({"result": "ok"})
+
+    async def handle_api_speed(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        mode = int(body.get("mode", 2))
+        loop = asyncio.get_event_loop()
+        taskid = self._state.get("taskid", "-1")
+        await loop.run_in_executor(None, lambda: self.client.publish_web(
+            "print", "update",
+            {"taskid": taskid, "settings": {"print_speed_mode": mode}},
+        ))
+        self._state["print_speed_mode"] = mode
         return web.json_response({"result": "ok"})
 
     async def handle_api_ams_feed(self, request):
@@ -1799,6 +1886,7 @@ function toggleCam(){if(camOn)camStop();else camStart()}
             "filename":         s["filename"],
             "camera_url":       s["camera_url"],
             "fan_speed":        s["fan_speed"],
+            "print_speed_mode": s["print_speed_mode"],
             "light_on":         s["light_on"],
             "light_brightness": s["light_brightness"],
             "ams_slots":        self._ams_slots,
@@ -2255,6 +2343,7 @@ def build_app(bridge: KobraXBridge) -> web.Application:
     # New API endpoints
     r.add_post("/api/light",               bridge.handle_api_light)
     r.add_post("/api/fan",                 bridge.handle_api_fan)
+    r.add_post("/api/speed",               bridge.handle_api_speed)
     r.add_post("/api/ams/feed",            bridge.handle_api_ams_feed)
     r.add_post("/api/axis",                bridge.handle_api_axis)
     r.add_post("/api/temperature",         bridge.handle_api_temperature)
