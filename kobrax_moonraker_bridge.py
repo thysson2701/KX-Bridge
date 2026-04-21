@@ -48,6 +48,12 @@ KOBRA_TO_KLIPPER_STATE = {
     "checking":      "printing",
     "updated":       "printing",
     "init":          "printing",
+    "pausing":       "paused",
+    "paused":        "paused",
+    "resuming":      "printing",
+    "resumed":       "printing",
+    "stopping":      "printing",
+    "stoped":        "standby",
     "finished":      "complete",
     "failed":        "error",
     "canceled":      "standby",
@@ -118,6 +124,9 @@ class KobraXBridge:
         self._state["print_state"]    = KOBRA_TO_KLIPPER_STATE.get(kobra_state, "printing")
         if kobra_state:
             self._state["kobra_state"] = kobra_state
+        if kobra_state in ("stoped", "canceled"):
+            self._state["progress"] = 0.0
+            self._state["filename"] = ""
         self._state["filename"]       = d.get("filename", self._state["filename"])
         if "progress" in d:
             self._state["progress"]   = float(d["progress"]) / 100.0
@@ -519,17 +528,20 @@ class KobraXBridge:
 
     async def handle_print_pause(self, request):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.client.pause_print)
+        taskid = self._state.get("taskid", "-1")
+        await loop.run_in_executor(None, lambda: self.client.pause_print(taskid))
         return web.json_response({"result": "ok"})
 
     async def handle_print_resume(self, request):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.client.resume_print)
+        taskid = self._state.get("taskid", "-1")
+        await loop.run_in_executor(None, lambda: self.client.resume_print(taskid))
         return web.json_response({"result": "ok"})
 
     async def handle_print_cancel(self, request):
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.client.stop_print)
+        taskid = self._state.get("taskid", "-1")
+        await loop.run_in_executor(None, lambda: self.client.stop_print(taskid))
         return web.json_response({"result": "ok"})
 
     async def handle_octoprint_version(self, request):
@@ -1118,7 +1130,7 @@ function toggleTheme(){
 // ── i18n ──
 var LANG_DE={
   header_status_standby:'Bereit',header_status_printing:'Druckt',header_status_complete:'Fertig',header_status_error:'Fehler',
-  kobra_free:'Bereit',kobra_busy:'Beschäftigt',kobra_printing:'Druckt',kobra_preheating:'Aufheizen',kobra_auto_leveling:'Nivellierung',kobra_checking:'Prüfung',kobra_updated:'Aktualisierung',kobra_init:'Initialisierung',kobra_finished:'Abgeschlossen',kobra_failed:'Fehler',kobra_canceled:'Abgebrochen',kobra_offline:'Offline',
+  kobra_free:'Bereit',kobra_busy:'Beschäftigt',kobra_printing:'Druckt',kobra_preheating:'Aufheizen',kobra_auto_leveling:'Nivellierung',kobra_checking:'Prüfung',kobra_updated:'Aktualisierung',kobra_init:'Initialisierung',kobra_pausing:'Pausiert...',kobra_paused:'Pausiert',kobra_resuming:'Fortsetzen...',kobra_resumed:'Fortgesetzt',kobra_stopping:'Stoppt...',kobra_stoped:'Gestoppt',kobra_finished:'Abgeschlossen',kobra_failed:'Fehler',kobra_canceled:'Abgebrochen',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Druck',nav_temps:'Temperaturen',nav_motion:'Achsen',nav_ams:'AMS',nav_extras:'Licht / Lüfter',nav_console:'Konsole',
   card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Lüfter',card_speed:'Druckgeschwindigkeit',card_cam:'Kamera',
   speed_silent:'🐢 Leise',speed_normal:'⚡ Normal',speed_sport:'🚀 Sport',
@@ -1143,7 +1155,7 @@ var LANG_DE={
 };
 var LANG_EN={
   header_status_standby:'Ready',header_status_printing:'Printing',header_status_complete:'Complete',header_status_error:'Error',
-  kobra_free:'Ready',kobra_busy:'Busy',kobra_printing:'Printing',kobra_preheating:'Preheating',kobra_auto_leveling:'Auto Leveling',kobra_checking:'Checking',kobra_updated:'Updating',kobra_init:'Initializing',kobra_finished:'Finished',kobra_failed:'Error',kobra_canceled:'Cancelled',kobra_offline:'Offline',
+  kobra_free:'Ready',kobra_busy:'Busy',kobra_printing:'Printing',kobra_preheating:'Preheating',kobra_auto_leveling:'Auto Leveling',kobra_checking:'Checking',kobra_updated:'Updating',kobra_init:'Initializing',kobra_pausing:'Pausing...',kobra_paused:'Paused',kobra_resuming:'Resuming...',kobra_resumed:'Resumed',kobra_stopping:'Stopping...',kobra_stoped:'Stopped',kobra_finished:'Finished',kobra_failed:'Error',kobra_canceled:'Cancelled',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Print',nav_temps:'Temperatures',nav_motion:'Motion',nav_ams:'AMS',nav_extras:'Light / Fan',nav_console:'Console',
   card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Fan',card_speed:'Print Speed',card_cam:'Camera',
   speed_silent:'🐢 Silent',speed_normal:'⚡ Normal',speed_sport:'🚀 Sport',

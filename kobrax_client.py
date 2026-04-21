@@ -394,14 +394,14 @@ class KobraXClient:
     def stop_camera(self) -> dict | None:
         return self.publish("video", "stopCapture")
 
-    def pause_print(self) -> dict | None:
-        return self.publish("print", "pause")
+    def pause_print(self, taskid: str = "-1") -> dict | None:
+        return self.publish("print", "pause", {"taskid": taskid})
 
-    def resume_print(self) -> dict | None:
-        return self.publish("print", "resume")
+    def resume_print(self, taskid: str = "-1") -> dict | None:
+        return self.publish("print", "resume", {"taskid": taskid})
 
-    def stop_print(self) -> dict | None:
-        return self.publish("print", "stop")
+    def stop_print(self, taskid: str = "-1") -> dict | None:
+        return self.publish("print", "stop", {"taskid": taskid})
 
     # -- G-Code Upload -------------------------------------------------------
 

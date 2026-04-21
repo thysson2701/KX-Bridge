@@ -1,25 +1,9 @@
-# KX-Bridge
+# KX-Bridge – Anycubic Kobra X Moonraker Bridge
 
-Connects the Anycubic Kobra X to OrcaSlicer – no Klipper, no Raspberry Pi required.
+**Version:** 0.9.1-beta4  
+**Status:** Public Beta – suitable for home users, feedback welcome
 
-KX-Bridge runs on your PC or NAS and provides a Moonraker-compatible interface so OrcaSlicer can control the printer directly: print start, temperatures, progress, pause/resume/cancel, AMS filament changes, print speed, and more.
-
-**Version:** 0.9.1-beta4
-
----
-
-## Included files
-
-| File | Description |
-|------|-------------|
-| `kobrax_moonraker_bridge.py` | Bridge main program |
-| `kx-bridge` | Pre-built Linux binary |
-| `extract_credentials.exe` | Read credentials from AnycubicSlicerNext (Windows) |
-| `extract_credentials` | Read credentials from AnycubicSlicerNext (Linux) |
-| `kobra_x_orcaslicer_preset.zip` | OrcaSlicer printer profile for the Kobra X |
-| `bridge.sh` | Linux service manager |
-| `Dockerfile` / `docker-compose.yml` | Docker deployment |
-| `.env.example` | Configuration template |
+KX-Bridge is a Moonraker-compatible HTTP/WebSocket bridge for the **Anycubic Kobra X** 3D printer. It allows you to control the printer through OrcaSlicer and other Moonraker-compatible software — no Klipper, no Raspberry Pi required.
 
 ---
 
@@ -40,93 +24,129 @@ KX-Bridge runs on your PC or NAS and provides a Moonraker-compatible interface s
 
 ## Requirements
 
-- Anycubic Kobra X in LAN mode (printer must be reachable via LAN, not only through Anycubic Cloud)
-- PC, NAS, or server on the same network (Windows or Linux)
-- Docker or Python 3.9+
-- Printer MQTT credentials → [Step 1](#step-1-extract-credentials)
+- Anycubic Kobra X on your local network (LAN, no Wi-Fi client isolation)
+- Printer MQTT credentials (→ see [Extracting credentials](#extracting-credentials))
+- Docker **or** Python 3.9+ **or** the pre-built Linux binary
 
 ---
 
-## Quick start
-
-### Step 1: Extract credentials
-
-The bridge needs printer-specific MQTT credentials.
-
-> **Important:** The printer must be in LAN mode. The credentials can only be extracted when the printer is reachable directly over LAN (not solely through Anycubic Cloud).
-
-Start AnycubicSlicerNext and connect to the printer (wait until the printer status is shown), then:
-
-**Windows:**
-```
-extract_credentials.exe --write-env
-```
-
-**Linux:**
-```bash
-chmod +x extract_credentials
-./extract_credentials --write-env
-```
-
-The credentials are saved automatically to `.env`.
-
-> If the result looks uncertain: `--verbose` shows all found candidates. Enter the correct value manually in `.env`.
-
----
-
-### Step 2: Check configuration
+## Quick start – Docker (recommended)
 
 ```bash
+# 1. Create .env
 cp .env.example .env
-# Open .env and verify the values
+# Fill in your printer data (→ extract_credentials)
+
+# 2. Start the bridge
+docker compose up -d
+
+# 3. In OrcaSlicer: add printer → "Moonraker" → http://BRIDGE-IP:7125
+```
+
+Check logs:
+```bash
+docker compose logs -f
+```
+
+Update:
+```bash
+docker compose pull && docker compose up -d
 ```
 
 ---
 
-### Step 3: Start the bridge
+## Quick start – Binary (Linux)
 
-**Option A – Docker (recommended):**
-```bash
-docker compose up -d
-```
-Runs in the background and restarts automatically after a system reboot.
-
-**Option B – Linux binary:**
 ```bash
 chmod +x kx-bridge
-./kx-bridge
-# Or with the service manager:
-./bridge.sh start
+./kx-bridge --printer-ip 192.168.x.x --username userXXXX --password XXXXX \
+            --device-id XXXXX --mode-id 20030
 ```
 
-**Option C – Python directly:**
+Or place a `.env` file in the same directory — the bridge reads it automatically.
+
+---
+
+## Quick start – Python directly
+
 ```bash
 pip install aiohttp
+python kobrax_moonraker_bridge.py --printer-ip 192.168.x.x ...
+# Or fill in .env and start without arguments
 python kobrax_moonraker_bridge.py
 ```
 
 ---
 
-### Step 4: Install OrcaSlicer profile
+## Extracting credentials
 
-1. Import `kobra_x_orcaslicer_preset.zip` into OrcaSlicer:  
-   File → Import → Import Configs → select ZIP
-2. Select Anycubic Kobra X as your printer
+The MQTT credentials are printer-specific and are generated on first connection with AnycubicSlicerNext. The `extract_credentials` tool reads them from the memory of the running slicer.
+
+**Requirement:** AnycubicSlicerNext must be running and connected to the printer.
+
+### Windows
+
+```
+extract_credentials.exe --write-env
+```
+
+Writes the found credentials directly to `.env`.
+
+### Linux
+
+```bash
+chmod +x extract_credentials
+./extract_credentials --write-env
+```
+
+### Output
+
+```
+[*] Process found: AnycubicSlicerNext.exe (PID 1234)
+[*] 1986 memory segments read (738.8 MB)
+[*] Analyzing ... 100% (739 MB)
+
+=======================================================
+  RESULTS
+=======================================================
+  Username      userXXXXXXXXXX  (hits: 47)
+  Password      ***************  (hits: 1046)
+  Device-ID     xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  (hits: 3504)
+  Printer IP    192.168.x.x  (hits: 3036)
+=======================================================
+
+Hint: pass --write-env to save credentials to '.env'.
+```
+
+All credentials are **processed locally only** — nothing is sent to external servers.
 
 ---
 
-### Step 5: Connect OrcaSlicer
+## Configuration (.env)
 
-1. Open printer settings
+```env
+PRINTER_IP=192.168.x.x       # Printer IP address
+MQTT_PORT=9883                # Default, do not change
+MQTT_USERNAME=userXXXXXXXX   # Starts with "user"
+MQTT_PASSWORD=XXXXXXXXXXXXXX  # ~15 characters, mixed case
+DEVICE_ID=xxxxxxxx...         # 32-character hex string
+MODE_ID=20030                 # Kobra X default
+```
+
+---
+
+## OrcaSlicer setup
+
+1. Add printer → **Anycubic Kobra X** (or generic Klipper printer)
 2. Connection type: **Moonraker**
-3. Host: `http://BRIDGE-PC-IP:7125`
-4. Click "Test" — a success message confirms the connection
+3. Host: `http://BRIDGE-HOST:7125`
+4. Test connection → should show "Online"
 
 ---
 
 ## Web UI
 
-The bridge serves a web interface at `http://BRIDGE-IP:7125`:
+The bridge serves a web interface at `http://BRIDGE-HOST:7125`:
 
 | Section | Function |
 |---------|----------|
@@ -136,7 +156,7 @@ The bridge serves a web interface at `http://BRIDGE-IP:7125`:
 | Print Speed | Silent / Normal / Sport |
 | Fan / Light | Fan speed and work light |
 | AMS | Load / unload filament |
-| Camera | Live preview (if supported by the printer) |
+| Camera | Live preview (if supported by printer) |
 | ⚙ Settings | MQTT credentials, poll interval, self-update |
 
 ### Self-update
@@ -145,26 +165,32 @@ The ⚙ menu in the web UI lets you check for new versions and update the bridge
 
 ---
 
-## bridge.sh – Service manager (Linux)
+## bridge.sh (Linux service manager)
 
 ```bash
-./bridge.sh start     # Start in background
-./bridge.sh stop      # Stop
-./bridge.sh restart   # Restart
-./bridge.sh status    # Show status
-./bridge.sh log 50    # Show last 50 log lines
+./bridge.sh start    # Start bridge in background
+./bridge.sh stop     # Stop bridge
+./bridge.sh restart  # Restart
+./bridge.sh status   # Check status and port
+./bridge.sh log 50   # Show last 50 log lines
 ```
 
 ---
 
-## Docker – Useful commands
+## Printer states
 
-```bash
-docker compose up -d                         # Start
-docker compose down                          # Stop
-docker compose logs -f                       # Follow logs
-docker compose pull && docker compose up -d  # Update
-```
+The bridge translates internal Kobra states into Moonraker-compatible states:
+
+| Kobra state | Meaning |
+|-------------|---------|
+| free | Ready |
+| printing / busy | Printing |
+| pausing / paused | Paused |
+| resuming / resumed | Resuming |
+| stopping / stoped | Stopping |
+| finished | Complete |
+| canceled | Cancelled |
+| failed | Error |
 
 ---
 
@@ -172,19 +198,14 @@ docker compose pull && docker compose up -d  # Update
 
 **Port 7125 already in use:**
 ```bash
-./bridge.sh stop
+./bridge.sh stop    # or: fuser -k 7125/tcp
 ./bridge.sh start
 ```
 
-**OrcaSlicer connection test fails:**
-- Check firewall: port 7125 must be reachable
-- Check bridge log: `./bridge.sh log` or `docker compose logs`
-- Is the printer IP in `.env` correct?
-
-**Credentials rejected:**
-- Start AnycubicSlicerNext and connect to the printer
-- Run `extract_credentials --verbose` and check all candidates
-- Enter the correct value manually in `.env`, then restart the bridge
+**Invalid credentials / connection refused:**
+- Start AnycubicSlicerNext, connect to the printer, then run `extract_credentials` again
+- If the result looks uncertain: `extract_credentials --verbose` shows all candidates
+- Manually enter the correct candidate in `.env` and restart the bridge
 
 **Temperature changes are ignored:**
 - During an active print, temperature changes are sent via a separate channel — this is normal and the bridge handles it automatically.
@@ -192,21 +213,26 @@ docker compose pull && docker compose up -d  # Update
 **Docker: Permission denied:**
 ```bash
 sudo usermod -aG docker $USER
-# Log out and back in, then try again
+# Log out and back in
+```
+
+**Docker: .env not found:**
+```bash
+# .env must be in the same directory as docker-compose.yml
+cp .env.example .env && nano .env
 ```
 
 ---
 
-## Configuration reference (.env)
+## Logs
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `PRINTER_IP` | Printer IP address | `192.168.1.100` |
-| `MQTT_PORT` | MQTT port (do not change) | `9883` |
-| `MQTT_USERNAME` | Username (starts with "user") | `userXXXXXXXXXX` |
-| `MQTT_PASSWORD` | Password (~15 characters) | `***` |
-| `DEVICE_ID` | Device ID (32 hex characters) | `xxxxxxxx...` |
-| `MODE_ID` | Model ID (Kobra X default) | `20030` |
+```bash
+# Docker
+docker compose logs -f kx-bridge
+
+# Binary / Python
+tail -f /tmp/bridge.log   # when using bridge.sh
+```
 
 ---
 
@@ -214,14 +240,11 @@ sudo usermod -aG docker $USER
 
 - The bridge binds to `0.0.0.0:7125` by default — use on your local network only
 - `.env` contains printer credentials — do not share publicly
-- All credentials are processed locally only — nothing is sent to external servers
+- The credentials are printer-specific and have no access to Anycubic cloud services
 
 ---
 
-## Disclaimer
+## License & legal
 
-This project is intended for private use and to enable interoperability between the Anycubic Kobra X and free software (OrcaSlicer).
-
-`extract_credentials` only reads the memory of the AnycubicSlicerNext process running on your own PC. No data is transmitted or stored anywhere other than the local `.env` file.
-
-This project is not affiliated with Anycubic and is not operated commercially.
+This project was created through interoperability research under §69e UrhG (German copyright law).  
+For private, non-commercial use only.
