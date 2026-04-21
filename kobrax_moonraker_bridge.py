@@ -82,6 +82,7 @@ class KobraXBridge:
             "fan_speed":          0,
             "light_on":           False,
             "light_brightness":   80,
+            "taskid":             "-1",
         }
         self._ams_slots: list[dict] = []
         self._ams_loaded_slot: int = -1
@@ -125,6 +126,8 @@ class KobraXBridge:
             self._state["curr_layer"] = d["curr_layer"]
         if "total_layers" in d:
             self._state["total_layers"] = d["total_layers"]
+        if "taskid" in d:
+            self._state["taskid"] = str(d["taskid"])
         self._push_status_update()
 
     def _on_info(self, payload: dict):
@@ -1642,18 +1645,29 @@ function toggleCam(){if(camOn)camStop();else camStart()}
         nozzle = body.get("nozzle")
         bed    = body.get("bed")
         loop = asyncio.get_event_loop()
-        if nozzle is not None:
-            n = int(float(nozzle))
+        printing = self._state.get("print_state") == "printing"
+        if printing:
+            # During print: runtime update via web/printer topic, one setting at a time
+            taskid = self._state.get("taskid", "-1")
+            if nozzle is not None:
+                n = int(float(nozzle))
+                await loop.run_in_executor(None, lambda: self.client.publish_web(
+                    "print", "update",
+                    {"taskid": taskid, "settings": {"target_nozzle_temp": n}},
+                ))
+            if bed is not None:
+                b = int(float(bed))
+                await loop.run_in_executor(None, lambda: self.client.publish_web(
+                    "print", "update",
+                    {"taskid": taskid, "settings": {"target_hotbed_temp": b}},
+                ))
+        else:
+            # Idle: standard tempature/set with both values
+            n = int(float(nozzle)) if nozzle is not None else int(self._state["nozzle_target"])
+            b = int(float(bed))    if bed    is not None else int(self._state["bed_target"])
             await loop.run_in_executor(None, lambda: self.client.publish(
                 "tempature", "set",
-                {"type": 0, "target_nozzle_temp": n, "target_hotbed_temp": 0},
-                timeout=0
-            ))
-        if bed is not None:
-            b = int(float(bed))
-            await loop.run_in_executor(None, lambda: self.client.publish(
-                "tempature", "set",
-                {"type": 1, "target_hotbed_temp": b, "target_nozzle_temp": 0},
+                {"target_nozzle_temp": n, "target_hotbed_temp": b},
                 timeout=0
             ))
         return web.json_response({"result": "ok"})

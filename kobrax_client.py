@@ -124,6 +124,10 @@ class KobraXClient:
         return (f"anycubic/anycubicCloud/v1/slicer/printer/"
                 f"{self.mode_id}/{self.device_id}/{msg_type}")
 
+    def _web_topic(self, msg_type: str) -> str:
+        return (f"anycubic/anycubicCloud/v1/web/printer/"
+                f"{self.mode_id}/{self.device_id}/{msg_type}")
+
     def _sub_topic(self) -> str:
         return (f"anycubic/anycubicCloud/v1/printer/public/"
                 f"{self.mode_id}/{self.device_id}/#")
@@ -344,6 +348,23 @@ class KobraXClient:
         if not received:
             return None
         return entry["result"]
+
+    def publish_web(self, msg_type: str, action: str, data=None) -> None:
+        """Fire-and-forget publish on the web/printer topic (used for runtime updates during print)."""
+        msgid   = str(uuid.uuid4())
+        payload = json.dumps({
+            "type":      msg_type,
+            "action":    action,
+            "msgid":     msgid,
+            "timestamp": int(time.time() * 1000),
+            "data":      data,
+        }, separators=(",", ":"))
+        topic = self._web_topic(msg_type)
+        try:
+            with self._lock:
+                self._sock.sendall(_build_publish(topic, payload))
+        except Exception as e:
+            print(f"[kobrax] web send error: {e}")
 
     # -- High-level commands -------------------------------------------------
 
