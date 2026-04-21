@@ -17,6 +17,8 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
+import re
 import sys
 import tempfile
 import time
@@ -56,8 +58,9 @@ KLIPPER_VERSION   = "v0.12.0-1"
 
 
 class KobraXBridge:
-    def __init__(self, client: KobraXClient):
+    def __init__(self, client: KobraXClient, args=None):
         self.client = client
+        self._args = args
         self.ws_clients: set[web.WebSocketResponse] = set()
         self._last_state: dict = {}
         self._state = {
@@ -66,6 +69,7 @@ class KobraXBridge:
             "bed_temp":           0.0,
             "bed_target":         0.0,
             "print_state":        "standby",
+            "kobra_state":        "free",
             "filename":           "",
             "progress":           0.0,
             "print_duration":     0,
@@ -110,6 +114,8 @@ class KobraXBridge:
         d = payload.get("data") or {}
         kobra_state = payload.get("state", "")
         self._state["print_state"]    = KOBRA_TO_KLIPPER_STATE.get(kobra_state, "printing")
+        if kobra_state:
+            self._state["kobra_state"] = kobra_state
         self._state["filename"]       = d.get("filename", self._state["filename"])
         if "progress" in d:
             self._state["progress"]   = float(d["progress"]) / 100.0
@@ -128,6 +134,7 @@ class KobraXBridge:
         kobra_state = d.get("state", "")
         if kobra_state:
             self._state["print_state"] = KOBRA_TO_KLIPPER_STATE.get(kobra_state, "standby")
+            self._state["kobra_state"] = kobra_state
         t = d.get("temp") or {}
         if t:
             self._state["nozzle_temp"]   = float(t.get("curr_nozzle_temp", 0))
@@ -630,6 +637,7 @@ main{flex:1;overflow-y:auto;padding:20px}
 
 /* ── TEMPS ── */
 .temp-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.temp-card-inner{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .temp-block{background:var(--raised);border-radius:10px;padding:14px;position:relative}
 .temp-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--txt2);margin-bottom:6px}
 .temp-row{display:flex;align-items:baseline;gap:6px}
@@ -702,6 +710,35 @@ canvas.tchart{width:100%;height:60px;display:block;border-radius:6px;background:
 .panel{display:none}
 .panel.active{display:block}
 
+/* ── MODAL ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);
+  z-index:200;align-items:center;justify-content:center;padding:16px}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:14px;
+  width:100%;max-width:480px;max-height:90vh;overflow-y:auto;padding:24px;
+  display:flex;flex-direction:column;gap:18px}
+.modal-header{display:flex;align-items:center;justify-content:space-between}
+.modal-title{font-size:15px;font-weight:700;color:var(--txt)}
+.modal-close{background:none;border:none;color:var(--txt2);font-size:20px;
+  cursor:pointer;padding:4px 8px;border-radius:6px}
+.modal-close:hover{background:var(--raised);color:var(--txt)}
+.modal-section{font-size:10px;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--txt2);margin-bottom:6px;margin-top:4px}
+.modal-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.modal-field label{font-size:12px;color:var(--txt2)}
+.modal-field input{background:var(--raised);border:1px solid var(--border);
+  border-radius:7px;color:var(--txt);padding:7px 10px;font-size:13px;width:100%}
+.modal-field input:focus{outline:none;border-color:var(--accent)}
+.poll-btns{display:flex;gap:8px}
+.poll-btn{flex:1;padding:7px;background:var(--raised);border:1px solid var(--border);
+  border-radius:7px;color:var(--txt2);cursor:pointer;font-size:13px;transition:all .15s}
+.poll-btn.active{background:var(--accent);border-color:var(--accent);color:#000;font-weight:600}
+.update-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.update-status{font-size:12px;color:var(--txt2);flex:1;min-width:0}
+.modal-save{width:100%;padding:10px;background:var(--accent);border:none;
+  border-radius:8px;color:#000;font-weight:700;font-size:14px;cursor:pointer;margin-top:4px}
+.modal-save:hover{opacity:.88}
+
 /* ── BOTTOM NAV (mobile) ── */
 nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
   background:var(--card);border-top:1px solid var(--border);
@@ -711,20 +748,52 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
 .bnav-btn.active{color:var(--accent)}
 .bnav-icon{font-size:20px}
 
-@media(max-width:768px){
-  nav.sidebar{display:none}
-  nav.bottom-nav{display:flex}
-  main{padding:12px;padding-bottom:72px}
-  .hero{grid-template-columns:1fr}
-  .temp-pair{grid-template-columns:1fr}
-  .ams-slots{grid-template-columns:repeat(2,1fr)}
-  .joypad{grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,48px)}
-}
-@media(min-width:769px) and (max-width:1200px){
+/* ── Tablet (769–1100px): schmale Sidebar ── */
+@media(min-width:769px) and (max-width:1100px){
   nav.sidebar{width:52px;padding:12px 4px}
   .nav-btn .nav-text{display:none}
   .nav-btn{justify-content:center;padding:10px}
   .nav-icon{width:auto}
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .hero{grid-template-columns:1fr}
+}
+
+/* ── Mobile (≤768px): Bottom-Nav, 1-Spalte ── */
+@media(max-width:768px){
+  nav.sidebar{display:none}
+  nav.bottom-nav{display:flex}
+  main{padding:10px;padding-bottom:72px}
+
+  /* Header kompakt */
+  header{padding:0 12px;gap:8px}
+  .hname{display:none}
+
+  /* 1-Spalten-Grid, full-width spans funktionieren weiterhin */
+  .grid{grid-template-columns:1fr;gap:12px}
+
+  /* Hero: Kamera über Info */
+  .hero{grid-template-columns:1fr}
+  .cam-wrap{max-height:220px}
+
+  /* Temp-Pair und Temp-Card übereinander */
+  .temp-pair{grid-template-columns:1fr}
+  .temp-card-inner{grid-template-columns:1fr}
+
+  /* AMS: 2 Spalten */
+  .ams-slots{grid-template-columns:repeat(2,1fr)}
+
+  /* Joypad etwas kleiner */
+  .joypad{grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,44px);gap:5px}
+  .joy{font-size:16px}
+
+  /* Buttons größere Touch-Targets */
+  .btn{padding:10px 14px;font-size:13px}
+  .btn-sm{padding:8px 12px}
+  .step-btn{padding:8px 12px;font-size:13px}
+
+  /* Modal vollbreite auf kleinen Screens */
+  .modal-box{padding:16px;border-radius:10px}
+  .poll-btns{gap:6px}
 }
 </style>
 </head>
@@ -736,22 +805,74 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
   <div class="hbadge" id="h-badge"><span class="dot"></span><span id="h-state">Standby</span></div>
   <button class="theme-btn" onclick="toggleTheme()">☀ / ☾</button>
   <button class="theme-btn" onclick="toggleLang()" id="lang-btn">EN</button>
+  <button class="theme-btn" onclick="openSettings()" id="settings-btn" title="Einstellungen">⚙</button>
 </header>
+
+<!-- ═══ SETTINGS MODAL ═══ -->
+<div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="modal-title-settings">Einstellungen</span>
+      <button class="modal-close" onclick="closeSettings()">✕</button>
+    </div>
+
+    <div>
+      <div class="modal-section" id="modal-sec-connection">Verbindung</div>
+      <div class="modal-field">
+        <label id="lbl-printer-ip">Drucker-IP</label>
+        <input type="text" id="s-printer-ip" placeholder="192.168.x.x">
+      </div>
+      <div class="modal-field">
+        <label id="lbl-mqtt-port">MQTT-Port</label>
+        <input type="number" id="s-mqtt-port" placeholder="9883">
+      </div>
+      <div class="modal-field">
+        <label id="lbl-username">MQTT-Benutzername</label>
+        <input type="text" id="s-username" placeholder="userXXXXXXXX" autocomplete="off">
+      </div>
+      <div class="modal-field">
+        <label id="lbl-password">MQTT-Passwort</label>
+        <input type="password" id="s-password" autocomplete="off">
+      </div>
+      <div class="modal-field">
+        <label id="lbl-device-id">Device-ID</label>
+        <input type="text" id="s-device-id" placeholder="32 Hex-Zeichen">
+      </div>
+      <div class="modal-field">
+        <label id="lbl-mode-id">Mode-ID</label>
+        <input type="text" id="s-mode-id" placeholder="20030">
+      </div>
+    </div>
+
+    <div>
+      <div class="modal-section" id="modal-sec-poll">Poll-Intervall</div>
+      <div class="poll-btns">
+        <button class="poll-btn" onclick="setPoll(1000)" id="poll-1">1s</button>
+        <button class="poll-btn active" onclick="setPoll(2000)" id="poll-2">2s</button>
+        <button class="poll-btn" onclick="setPoll(5000)" id="poll-5">5s</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="modal-section" id="modal-sec-version">Version</div>
+      <div class="update-row">
+        <span id="s-version-label" style="font-size:13px;color:var(--txt)">–</span>
+        <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="checkUpdate()" id="btn-update-check">🔄 <span id="lbl-update-check">Auf Updates prüfen</span></button>
+      </div>
+      <div class="update-status" id="update-status" style="margin-top:6px"></div>
+      <button class="btn btn-sm btn-accent" id="btn-update-apply" style="display:none;margin-top:8px" onclick="applyUpdate()">
+        <span id="lbl-update-apply">Jetzt installieren</span>
+      </button>
+    </div>
+
+    <button class="modal-save" onclick="saveSettings()" id="btn-save-settings">Speichern &amp; Neustart</button>
+  </div>
+</div>
 
 <div class="layout">
   <nav class="sidebar">
     <button class="nav-btn active" onclick="showPanel('dashboard')" id="nb-dashboard">
       <span class="nav-icon">⊞</span><span class="nav-text">Dashboard</span></button>
-    <button class="nav-btn" onclick="showPanel('print')" id="nb-print">
-      <span class="nav-icon">◉</span><span class="nav-text">Druck</span></button>
-    <button class="nav-btn" onclick="showPanel('temps')" id="nb-temps">
-      <span class="nav-icon">⊙</span><span class="nav-text">Temperaturen</span></button>
-    <button class="nav-btn" onclick="showPanel('motion')" id="nb-motion">
-      <span class="nav-icon">✛</span><span class="nav-text">Achsen</span></button>
-    <button class="nav-btn" onclick="showPanel('ams')" id="nb-ams">
-      <span class="nav-icon">◫</span><span class="nav-text">AMS</span></button>
-    <button class="nav-btn" onclick="showPanel('extras')" id="nb-extras">
-      <span class="nav-icon">⊜</span><span class="nav-text">Licht / Lüfter</span></button>
     <button class="nav-btn" onclick="showPanel('console')" id="nb-console">
       <span class="nav-icon">≡</span><span class="nav-text">Konsole</span></button>
   </nav>
@@ -760,42 +881,52 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
     <!-- ═══ DASHBOARD ═══ -->
     <div class="panel active" id="panel-dashboard">
       <div class="grid">
-        <div class="hero card" style="grid-column:1/-1">
-          <div style="display:grid;grid-template-columns:1fr 300px;gap:16px">
-            <div class="cam-wrap" id="cam-wrap">
-              <div class="cam-placeholder" id="cam-placeholder">📷 Kamera nicht gestartet</div>
-              <div class="cam-spinner" id="cam-spinner"></div>
-              <img id="cam-img" style="display:none;width:100%;height:auto" alt="Kamera">
-              <div class="cam-overlay" id="cam-overlay" style="display:none">
-                <div style="font-size:12px;color:#fff" id="cam-fname"></div>
-              </div>
-              <button class="cam-toggle" onclick="toggleCam()" id="cam-toggle-btn">▶ Kamera</button>
+        <!-- Kamera -->
+        <div class="card" style="grid-column:1/-1">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div class="card-title" style="margin-bottom:0"><span>📷</span> Kamera</div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-size:12px;color:var(--txt2)">💡 Licht</span>
+              <label class="toggle">
+                <input type="checkbox" id="d-light-toggle" onchange="setLight()">
+                <span class="toggle-track"></span>
+                <span class="toggle-thumb"></span>
+              </label>
             </div>
-            <div class="hero-info">
-              <img id="d-thumbnail" src="" alt="" style="display:none;width:100%;max-height:140px;object-fit:contain;border-radius:8px;background:#111">
-              <div>
-                <div style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--txt2);margin-bottom:6px" id="d-card-progress">Fortschritt</div>
-                <div class="pct-big"><span id="d-pct">0</span><small>%</small></div>
-                <div class="progress-bar" style="margin-top:8px"><div class="progress-fill" id="d-pbar" style="width:0%"></div></div>
-              </div>
-              <div class="meta-row">
-                <span id="d-elapsed">–</span>
-                <span id="d-layers" class="layer-badge">–</span>
-              </div>
-              <div class="fname" id="d-fname" title="">–</div>
-              <div class="ctrl-btns" id="d-ctrl-btns">
-                <button class="btn btn-pause btn-sm" id="d-btn-pause" onclick="printAction('pause')">⏸ Pause</button>
-                <button class="btn btn-resume btn-sm" id="d-btn-resume" onclick="printAction('resume')">▶ Weiter</button>
-                <button class="btn btn-cancel btn-sm" id="d-btn-cancel" onclick="confirmCancel()">✕ Stopp</button>
-              </div>
+          </div>
+          <div class="cam-wrap" id="cam-wrap">
+            <div class="cam-placeholder" id="cam-placeholder">📷 Kamera nicht gestartet</div>
+            <div class="cam-spinner" id="cam-spinner"></div>
+            <img id="cam-img" style="display:none;width:100%;height:auto" alt="Kamera">
+            <div class="cam-overlay" id="cam-overlay" style="display:none">
+              <div style="font-size:12px;color:#fff" id="cam-fname"></div>
             </div>
+            <button class="cam-toggle" onclick="toggleCam()" id="cam-toggle-btn">▶ Kamera</button>
           </div>
         </div>
 
-        <!-- mini temp card -->
-        <div class="card">
+        <!-- Fortschritt -->
+        <div class="card" style="grid-column:1/-1">
+          <div class="card-title"><span>◉</span> <span id="d-card-progress">Fortschritt</span></div>
+          <img id="d-thumbnail" src="" alt="" style="display:none;width:100%;max-height:160px;object-fit:contain;border-radius:8px;background:#111;margin-bottom:10px">
+          <div class="pct-big"><span id="d-pct">0</span><small>%</small></div>
+          <div class="progress-bar" style="margin:8px 0"><div class="progress-fill" id="d-pbar" style="width:0%"></div></div>
+          <div class="meta-row" style="margin-top:6px">
+            <span id="d-elapsed">–</span>
+            <span id="d-layers" class="layer-badge">–</span>
+          </div>
+          <div class="fname" id="d-fname" title="" style="margin-top:6px">–</div>
+          <div class="ctrl-btns" id="d-ctrl-btns" style="margin-top:12px">
+            <button class="btn btn-pause btn-sm" id="d-btn-pause" onclick="printAction('pause')">⏸ Pause</button>
+            <button class="btn btn-resume btn-sm" id="d-btn-resume" onclick="printAction('resume')">▶ Weiter</button>
+            <button class="btn btn-cancel btn-sm" id="d-btn-cancel" onclick="confirmCancel()">✕ Stopp</button>
+          </div>
+        </div>
+
+        <!-- Temperatursteuerung + Verlauf -->
+        <div class="card" style="grid-column:1/-1">
           <div class="card-title"><span>⊙</span> <span id="d-card-temps">Temperaturen</span></div>
-          <div class="temp-pair">
+          <div class="temp-card-inner">
             <div class="temp-block">
               <div class="temp-label">Nozzle</div>
               <div class="temp-row">
@@ -803,12 +934,14 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
                 <div class="temp-unit">°C</div>
               </div>
               <div class="temp-target">→ <span id="d-nt-t">0</span>°C</div>
-              <svg class="temp-arc" width="40" height="40" viewBox="0 0 40 40">
-                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--raised)" stroke-width="4"/>
-                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--accent2)" stroke-width="4"
-                  stroke-dasharray="100.5" stroke-dashoffset="100.5" id="d-narc"
-                  stroke-linecap="round" transform="rotate(-90 20 20)" style="transition:stroke-dashoffset .8s"/>
-              </svg>
+              <div class="progress-bar" style="margin:8px 0 0">
+                <div class="progress-fill" id="d-ntbar" style="width:0%;background:linear-gradient(90deg,var(--accent2),#ffb020)"></div>
+              </div>
+              <div class="temp-edit" style="margin-top:10px">
+                <input type="number" class="temp-input" id="p-nozzle-inp" placeholder="Ziel" min="0" max="300" style="flex:1">
+                <button class="btn btn-sm btn-accent" onclick="setNozzle()"><span class="lbl-set">Set</span></button>
+                <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('p-nozzle-inp').value=0;setNozzle()"><span class="lbl-off">Aus</span></button>
+              </div>
             </div>
             <div class="temp-block">
               <div class="temp-label">Bett</div>
@@ -817,132 +950,23 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
                 <div class="temp-unit">°C</div>
               </div>
               <div class="temp-target">→ <span id="d-bt-t">0</span>°C</div>
-              <svg class="temp-arc" width="40" height="40" viewBox="0 0 40 40">
-                <circle cx="20" cy="20" r="16" fill="none" stroke="var(--raised)" stroke-width="4"/>
-                <circle cx="20" cy="20" r="16" fill="none" stroke="#ff6b35" stroke-width="4"
-                  stroke-dasharray="100.5" stroke-dashoffset="100.5" id="d-barc"
-                  stroke-linecap="round" transform="rotate(-90 20 20)" style="transition:stroke-dashoffset .8s"/>
-              </svg>
-            </div>
-          </div>
-        </div>
-
-        <!-- mini light+fan -->
-        <div class="card">
-          <div class="card-title"><span>⊜</span> <span id="d-card-lightfan">Licht &amp; Lüfter</span></div>
-          <div class="toggle-row">
-            <span class="toggle-label">💡 Licht</span>
-            <label class="toggle">
-              <input type="checkbox" id="d-light-toggle" onchange="setLight()">
-              <span class="toggle-track"></span>
-              <span class="toggle-thumb"></span>
-            </label>
-          </div>
-          <div class="slider-row" style="margin-top:12px">
-            <span class="slider-label">🌀 Lüfter</span>
-            <input type="range" class="slider" min="0" max="100" value="0" id="d-fan" oninput="document.getElementById('d-fan-val').textContent=this.value" onchange="setFan()">
-            <span class="slider-val" id="d-fan-val">0</span>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ═══ DRUCK ═══ -->
-    <div class="panel" id="panel-print">
-      <div class="grid">
-        <div class="card">
-          <div class="card-title"><span>◉</span> <span id="ptitle-print">Drucksteuerung</span></div>
-          <div style="text-align:center;margin-bottom:16px">
-            <div class="pct-big"><span id="p-pct">0</span><small>%</small></div>
-            <div class="progress-bar" style="margin:8px 0"><div class="progress-fill" id="p-pbar" style="width:0%"></div></div>
-            <div class="meta-row" style="margin-top:4px">
-              <span id="p-elapsed">–</span>
-              <span id="p-layers" class="layer-badge">–</span>
-            </div>
-            <div class="fname" style="margin-top:8px" id="p-fname">–</div>
-          </div>
-          <div class="ctrl-btns" style="justify-content:center">
-            <button class="btn btn-pause" id="p-btn-pause" onclick="printAction('pause')">⏸ Pause</button>
-            <button class="btn btn-resume" id="p-btn-resume" onclick="printAction('resume')">▶ Fortsetzen</button>
-            <button class="btn btn-cancel" id="p-btn-cancel" onclick="confirmCancel()">✕ Abbrechen</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-title"><span>⊙</span> <span id="p-title-temps">Temperaturen (Live)</span></div>
-          <canvas id="p-chart" class="tchart" width="600" height="120"></canvas>
-          <div class="temp-pair" style="margin-top:12px">
-            <div class="temp-block">
-              <div class="temp-label">Nozzle</div>
-              <div class="temp-row">
-                <div class="temp-val" id="p-nt">–</div><div class="temp-unit">°C</div>
+              <div class="progress-bar" style="margin:8px 0 0">
+                <div class="progress-fill" id="d-btbar" style="width:0%;background:linear-gradient(90deg,#ff6b35,var(--warn))"></div>
               </div>
-              <div class="temp-target">→ <span id="p-nt-t">0</span>°C</div>
-              <div class="temp-edit">
-                <input type="number" class="temp-input" id="p-nozzle-inp" placeholder="Ziel" min="0" max="300">
-                <button class="btn btn-sm btn-accent" onclick="setNozzle()">Set</button>
-              </div>
-            </div>
-            <div class="temp-block">
-              <div class="temp-label">Bett</div>
-              <div class="temp-row">
-                <div class="temp-val" id="p-bt">–</div><div class="temp-unit">°C</div>
-              </div>
-              <div class="temp-target">→ <span id="p-bt-t">0</span>°C</div>
-              <div class="temp-edit">
-                <input type="number" class="temp-input" id="p-bed-inp" placeholder="Ziel" min="0" max="120">
-                <button class="btn btn-sm btn-accent" onclick="setBed()">Set</button>
+              <div class="temp-edit" style="margin-top:10px">
+                <input type="number" class="temp-input" id="p-bed-inp" placeholder="Ziel" min="0" max="120" style="flex:1">
+                <button class="btn btn-sm btn-accent" onclick="setBed()"><span class="lbl-set">Set</span></button>
+                <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('p-bed-inp').value=0;setBed()"><span class="lbl-off">Aus</span></button>
               </div>
             </div>
           </div>
+          <div style="margin-top:14px">
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:4px" id="d-chart-label">Verlauf (letzte 60 Messungen)</div>
+            <canvas id="d-chart" width="800" height="120" style="width:100%;height:120px;background:var(--raised);border-radius:8px"></canvas>
+          </div>
         </div>
-      </div>
-    </div>
 
-    <!-- ═══ TEMPS ═══ -->
-    <div class="panel" id="panel-temps">
-      <div class="grid">
-        <div class="card">
-          <div class="card-title"><span>⊙</span> <span id="ptitle-temps-nozzle">Nozzle</span></div>
-          <div class="temp-row">
-            <div class="temp-val" style="font-size:48px" id="t-nt">–</div>
-            <div class="temp-unit" style="font-size:20px">°C</div>
-          </div>
-          <div class="temp-target" style="margin-top:4px">Ziel: <span id="t-nt-t">0</span>°C</div>
-          <div class="progress-bar" style="margin:12px 0 0">
-            <div class="progress-fill" id="t-ntbar" style="width:0%;background:linear-gradient(90deg,var(--accent2),#ffb020)"></div>
-          </div>
-          <div class="temp-edit" style="margin-top:12px">
-            <input type="number" class="temp-input" id="t-nozzle-inp" placeholder="Ziel °C" min="0" max="300">
-            <button class="btn btn-accent" onclick="setNozzle2()">Setzen</button>
-            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('t-nozzle-inp').value=0;setNozzle2()">Aus</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-title"><span>⊙</span> <span id="ptitle-temps-bed">Heizbett</span></div>
-          <div class="temp-row">
-            <div class="temp-val" style="font-size:48px" id="t-bt">–</div>
-            <div class="temp-unit" style="font-size:20px">°C</div>
-          </div>
-          <div class="temp-target" style="margin-top:4px">Ziel: <span id="t-bt-t">0</span>°C</div>
-          <div class="progress-bar" style="margin:12px 0 0">
-            <div class="progress-fill" id="t-btbar" style="width:0%;background:linear-gradient(90deg,#ff6b35,var(--warn))"></div>
-          </div>
-          <div class="temp-edit" style="margin-top:12px">
-            <input type="number" class="temp-input" id="t-bed-inp" placeholder="Ziel °C" min="0" max="120">
-            <button class="btn btn-accent" onclick="setBed2()">Setzen</button>
-            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="document.getElementById('t-bed-inp').value=0;setBed2()">Aus</button>
-          </div>
-        </div>
-        <div class="card" style="grid-column:1/-1">
-          <div class="card-title"><span>◈</span> <span id="ptitle-temps-chart">Verlauf (letzte 60 Messungen)</span></div>
-          <canvas id="t-chart" width="800" height="140" style="width:100%;height:140px;background:var(--raised);border-radius:8px"></canvas>
-        </div>
-      </div>
-    </div>
-
-    <!-- ═══ MOTION ═══ -->
-    <div class="panel" id="panel-motion">
-      <div class="grid">
+        <!-- Achsensteuerung -->
         <div class="card">
           <div class="card-title"><span>✛</span> <span id="ptitle-motion-xy">XY-Achsen</span></div>
           <div class="joypad">
@@ -977,54 +1001,13 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
           </div>
           <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--txt2)">Schrittweite: <span id="step-display">1</span> mm</div>
         </div>
-      </div>
-    </div>
 
-    <!-- ═══ AMS ═══ -->
-    <div class="panel" id="panel-ams">
-      <div class="card">
-        <div class="card-title"><span>◫</span> <span id="ptitle-ams">AMS / Filamentbox</span></div>
-        <div class="ams-slots" id="ams-slots">
-          <div style="grid-column:1/-1;text-align:center;color:var(--txt2);padding:20px">
-            Keine AMS-Daten empfangen
-          </div>
-        </div>
-        <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-          <div style="font-size:12px;color:var(--txt2);margin-bottom:2px">Slot auswählen</div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <input type="range" id="ams-slot-sel" min="0" max="3" step="1" value="0"
-              class="slider" style="flex:1"
-              oninput="document.getElementById('ams-slot-label').textContent='Slot '+(parseInt(this.value)+1)">
-            <span id="ams-slot-label" style="min-width:48px;font-size:13px;font-weight:600">Slot 1</span>
-          </div>
-          <div style="display:flex;gap:10px">
-            <button class="btn" style="flex:1" onclick="amsFeed(1)">⬇ Einziehen</button>
-            <button id="btn-unload" class="btn" style="flex:1" onclick="amsFeed(2)">⬆ Ausziehen</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ═══ EXTRAS ═══ -->
-    <div class="panel" id="panel-extras">
-      <div class="grid">
+        <!-- Lüfter -->
         <div class="card">
-          <div class="card-title"><span>💡</span> <span id="ptitle-extras-light">Licht</span></div>
-          <div class="toggle-row">
-            <span class="toggle-label lbl-on-off">Ein / Aus</span>
-            <label class="toggle">
-              <input type="checkbox" id="e-light-toggle" onchange="setLight2()">
-              <span class="toggle-track"></span>
-              <span class="toggle-thumb"></span>
-            </label>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-title"><span>🌀</span> <span id="ptitle-extras-fan">Lüfter</span></div>
+          <div class="card-title"><span>🌀</span> <span id="d-card-lightfan">Lüfter</span></div>
           <div class="slider-row">
-            <span class="slider-label lbl-speed">Geschwindigkeit</span>
-            <input type="range" class="slider" min="0" max="100" value="0" id="e-fan" oninput="document.getElementById('e-fan-val').textContent=this.value" onchange="setFan2()">
-            <span class="slider-val" id="e-fan-val">0</span>
+            <input type="range" class="slider" min="0" max="100" value="0" id="d-fan" oninput="document.getElementById('d-fan-val').textContent=this.value" onchange="setFan()">
+            <span class="slider-val" id="d-fan-val">0</span>
           </div>
           <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" onclick="quickFan(0)">Aus</button>
@@ -1034,13 +1017,26 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
             <button class="btn btn-sm btn-accent" onclick="quickFan(100)">100%</button>
           </div>
         </div>
-        <div class="card">
-          <div class="card-title"><span>📷</span> <span id="ptitle-extras-camera">Kamera</span></div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-sm btn-accent" id="e-btn-cam-start" onclick="camStart()">▶ Start</button>
-            <button class="btn btn-sm" style="background:var(--raised);color:var(--txt)" id="e-btn-cam-stop" onclick="camStop()">◼ Stop</button>
+
+        <!-- AMS -->
+        <div class="card" style="grid-column:1/-1" id="d-ams-card">
+          <div class="card-title"><span>◫</span> <span id="d-card-ams">AMS / Filamentbox</span></div>
+          <div class="ams-slots" id="ams-slots">
+            <div style="grid-column:1/-1;text-align:center;color:var(--txt2);padding:20px" id="ams-no-data">Keine AMS-Daten empfangen</div>
           </div>
-          <div style="margin-top:10px;font-size:12px;color:var(--txt2)" id="e-cam-url">–</div>
+          <div id="ams-controls" style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
+            <div style="font-size:12px;color:var(--txt2);margin-bottom:2px" id="ams-slot-lbl">Slot auswählen</div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <input type="range" id="ams-slot-sel" min="0" max="3" step="1" value="0"
+                class="slider" style="flex:1"
+                oninput="document.getElementById('ams-slot-label').textContent='Slot '+(parseInt(this.value)+1)">
+              <span id="ams-slot-label" style="min-width:48px;font-size:13px;font-weight:600">Slot 1</span>
+            </div>
+            <div style="display:flex;gap:10px">
+              <button class="btn" style="flex:1" onclick="amsFeed(1)">⬇ Einziehen</button>
+              <button id="btn-unload" class="btn" style="flex:1" onclick="amsFeed(2)">⬆ Ausziehen</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1057,9 +1053,6 @@ nav.bottom-nav{display:none;position:fixed;bottom:0;left:0;right:0;
 
 <nav class="bottom-nav">
   <button class="bnav-btn active" onclick="showPanel('dashboard')" id="bnb-dashboard"><span class="bnav-icon">⊞</span>Dashboard</button>
-  <button class="bnav-btn" onclick="showPanel('print')" id="bnb-print"><span class="bnav-icon">◉</span>Druck</button>
-  <button class="bnav-btn" onclick="showPanel('motion')" id="bnb-motion"><span class="bnav-icon">✛</span>Achsen</button>
-  <button class="bnav-btn" onclick="showPanel('extras')" id="bnb-extras"><span class="bnav-icon">⊜</span>Extras</button>
   <button class="bnav-btn" onclick="showPanel('console')" id="bnb-console"><span class="bnav-icon">≡</span>Log</button>
 </nav>
 
@@ -1085,8 +1078,9 @@ function toggleTheme(){
 // ── i18n ──
 var LANG_DE={
   header_status_standby:'Bereit',header_status_printing:'Druckt',header_status_complete:'Fertig',header_status_error:'Fehler',
+  kobra_free:'Bereit',kobra_busy:'Beschäftigt',kobra_printing:'Druckt',kobra_preheating:'Aufheizen',kobra_auto_leveling:'Nivellierung',kobra_checking:'Prüfung',kobra_updated:'Aktualisierung',kobra_init:'Initialisierung',kobra_finished:'Abgeschlossen',kobra_failed:'Fehler',kobra_canceled:'Abgebrochen',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Druck',nav_temps:'Temperaturen',nav_motion:'Achsen',nav_ams:'AMS',nav_extras:'Licht / Lüfter',nav_console:'Konsole',
-  card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Licht & Lüfter',
+  card_progress:'Fortschritt',card_temps:'Temperaturen',card_light_fan:'Lüfter',
   cam_placeholder:'📷 Kamera nicht gestartet',btn_cam_start:'▶ Kamera',btn_cam_stop:'◼ Kamera',
   btn_pause:'⏸ Pause',btn_resume:'▶ Weiter',btn_cancel:'✕ Stopp',
   label_nozzle:'Nozzle',label_bed:'Bett',label_fan:'🌀 Lüfter',label_light:'💡 Licht',label_on_off:'Ein / Aus',label_speed:'Geschwindigkeit',
@@ -1098,12 +1092,18 @@ var LANG_DE={
   panel_extras_light:'Licht',panel_extras_fan:'Lüfter',panel_extras_camera:'Kamera',btn_cam_start2:'▶ Start',btn_cam_stop2:'◼ Stop',
   panel_console_title:'Ereignis-Log',
   log_light_on:'Licht an',log_light_off:'Licht aus',log_fan:'Lüfter →',log_nozzle:'Nozzle →',log_bed:'Bett →',log_axis:'Achse',log_home:'Home',log_home_all:'Home All',log_cam_start:'Kamera gestartet:',log_cam_stop:'Kamera gestoppt',log_poll_error:'Poll-Fehler:',log_error:'Fehler:',
-  confirm_cancel:'Druck wirklich abbrechen?'
+  confirm_cancel:'Druck wirklich abbrechen?',
+  settings_title:'Einstellungen',settings_connection:'Verbindung',settings_poll:'Poll-Intervall',settings_version:'Version',
+  settings_save:'Speichern & Neustart',settings_printer_ip:'Drucker-IP',settings_mqtt_port:'MQTT-Port',
+  settings_username:'MQTT-Benutzername',settings_password:'MQTT-Passwort',settings_device_id:'Device-ID',settings_mode_id:'Mode-ID',
+  update_check:'Auf Updates prüfen',update_checking:'Prüfe...',update_available:'verfügbar',update_none:'Bereits aktuell',
+  update_apply:'Jetzt installieren',update_applying:'Lade herunter...',update_restarting:'Starte neu...',update_error:'Fehler'
 };
 var LANG_EN={
   header_status_standby:'Ready',header_status_printing:'Printing',header_status_complete:'Complete',header_status_error:'Error',
+  kobra_free:'Ready',kobra_busy:'Busy',kobra_printing:'Printing',kobra_preheating:'Preheating',kobra_auto_leveling:'Auto Leveling',kobra_checking:'Checking',kobra_updated:'Updating',kobra_init:'Initializing',kobra_finished:'Finished',kobra_failed:'Error',kobra_canceled:'Cancelled',kobra_offline:'Offline',
   nav_dashboard:'Dashboard',nav_print:'Print',nav_temps:'Temperatures',nav_motion:'Motion',nav_ams:'AMS',nav_extras:'Light / Fan',nav_console:'Console',
-  card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Light & Fan',
+  card_progress:'Progress',card_temps:'Temperatures',card_light_fan:'Fan',
   cam_placeholder:'📷 Camera not started',btn_cam_start:'▶ Camera',btn_cam_stop:'◼ Camera',
   btn_pause:'⏸ Pause',btn_resume:'▶ Resume',btn_cancel:'✕ Stop',
   label_nozzle:'Nozzle',label_bed:'Bed',label_fan:'🌀 Fan',label_light:'💡 Light',label_on_off:'On / Off',label_speed:'Speed',
@@ -1115,7 +1115,12 @@ var LANG_EN={
   panel_extras_light:'Light',panel_extras_fan:'Fan',panel_extras_camera:'Camera',btn_cam_start2:'▶ Start',btn_cam_stop2:'◼ Stop',
   panel_console_title:'Event Log',
   log_light_on:'Light on',log_light_off:'Light off',log_fan:'Fan →',log_nozzle:'Nozzle →',log_bed:'Bed →',log_axis:'Axis',log_home:'Home',log_home_all:'Home All',log_cam_start:'Camera started:',log_cam_stop:'Camera stopped',log_poll_error:'Poll error:',log_error:'Error:',
-  confirm_cancel:'Really cancel the print?'
+  confirm_cancel:'Really cancel the print?',
+  settings_title:'Settings',settings_connection:'Connection',settings_poll:'Poll Interval',settings_version:'Version',
+  settings_save:'Save & Restart',settings_printer_ip:'Printer IP',settings_mqtt_port:'MQTT Port',
+  settings_username:'MQTT Username',settings_password:'MQTT Password',settings_device_id:'Device ID',settings_mode_id:'Mode ID',
+  update_check:'Check for Updates',update_checking:'Checking...',update_available:'available',update_none:'Already up to date',
+  update_apply:'Install Now',update_applying:'Downloading...',update_restarting:'Restarting...',update_error:'Error'
 };
 var currentLang='de';
 var T=LANG_DE;
@@ -1130,22 +1135,15 @@ function toggleLang(){
 function applyLang(){
   // Nav
   var nb=document.getElementById('nb-dashboard');if(nb)nb.querySelector('.nav-text').textContent=T.nav_dashboard;
-  nb=document.getElementById('nb-print');if(nb)nb.querySelector('.nav-text').textContent=T.nav_print;
-  nb=document.getElementById('nb-temps');if(nb)nb.querySelector('.nav-text').textContent=T.nav_temps;
-  nb=document.getElementById('nb-motion');if(nb)nb.querySelector('.nav-text').textContent=T.nav_motion;
-  nb=document.getElementById('nb-ams');if(nb)nb.querySelector('.nav-text').textContent=T.nav_ams;
-  nb=document.getElementById('nb-extras');if(nb)nb.querySelector('.nav-text').textContent=T.nav_extras;
   nb=document.getElementById('nb-console');if(nb)nb.querySelector('.nav-text').textContent=T.nav_console;
   // Bottom nav
   var bnb=document.getElementById('bnb-dashboard');if(bnb)bnb.lastChild.textContent=T.nav_dashboard;
-  bnb=document.getElementById('bnb-print');if(bnb)bnb.lastChild.textContent=T.nav_print;
-  bnb=document.getElementById('bnb-motion');if(bnb)bnb.lastChild.textContent=T.nav_motion;
-  bnb=document.getElementById('bnb-extras');if(bnb)bnb.lastChild.textContent=T.nav_extras;
   bnb=document.getElementById('bnb-console');if(bnb)bnb.lastChild.textContent=T.nav_console;
   // Dashboard card titles
   setText('d-card-progress',T.card_progress);
   setText('d-card-temps',T.card_temps);
   setText('d-card-lightfan',T.card_light_fan);
+  setText('d-card-ams',T.panel_ams_title);
   // Dashboard buttons
   setText('d-btn-pause',T.btn_pause);
   setText('d-btn-resume',T.btn_resume);
@@ -1153,41 +1151,33 @@ function applyLang(){
   setText('cam-toggle-btn',camOn?T.btn_cam_stop:T.btn_cam_start);
   setText('cam-placeholder-txt',T.cam_placeholder);
   // Temp labels
-  document.querySelectorAll('.lbl-nozzle').forEach(e=>e.textContent=T.label_nozzle);
-  document.querySelectorAll('.lbl-bed').forEach(e=>e.textContent=T.label_bed);
-  document.querySelectorAll('.lbl-light').forEach(e=>e.textContent=T.label_light);
-  document.querySelectorAll('.lbl-fan').forEach(e=>e.textContent=T.label_fan);
-  document.querySelectorAll('.lbl-on-off').forEach(e=>e.textContent=T.label_on_off);
-  document.querySelectorAll('.lbl-speed').forEach(e=>e.textContent=T.label_speed);
   document.querySelectorAll('.lbl-set').forEach(e=>e.textContent=T.label_set);
   document.querySelectorAll('.lbl-off').forEach(e=>e.textContent=T.label_off);
-  document.querySelectorAll('.lbl-target-c').forEach(e=>e.textContent=T.label_target_c);
-  // Panel titles
-  setText('ptitle-print',T.panel_print_title);
-  setText('ptitle-temps-nozzle',T.panel_temps_nozzle);
-  setText('ptitle-temps-bed',T.panel_temps_bed);
-  setText('ptitle-temps-chart',T.panel_temps_chart);
+  setText('d-chart-label',T.panel_temps_chart);
+  // Axis labels
   setText('ptitle-motion-xy',T.panel_motion_xy);
   setText('ptitle-motion-z',T.panel_motion_z);
-  setText('ptitle-ams',T.panel_ams_title);
-  setText('ptitle-extras-light',T.panel_extras_light);
-  setText('ptitle-extras-fan',T.panel_extras_fan);
-  setText('ptitle-extras-camera',T.panel_extras_camera);
-  setText('ptitle-console',T.panel_console_title);
-  // Home buttons
   document.querySelectorAll('.lbl-home-x').forEach(e=>e.textContent=T.btn_home_x);
   document.querySelectorAll('.lbl-home-y').forEach(e=>e.textContent=T.btn_home_y);
   document.querySelectorAll('.lbl-home-z').forEach(e=>e.textContent=T.btn_home_z);
   document.querySelectorAll('.lbl-home-all').forEach(e=>e.textContent=T.btn_home_all);
   document.querySelectorAll('.lbl-step').forEach(e=>e.textContent=T.label_step);
-  // Print panel buttons
-  setText('p-btn-pause',T.panel_print_btn_pause);
-  setText('p-btn-resume',T.panel_print_btn_resume);
-  setText('p-btn-cancel',T.panel_print_btn_cancel);
-  setText('p-title-temps',T.panel_print_temps_live);
-  // Extras buttons
-  setText('e-btn-cam-start',T.btn_cam_start2);
-  setText('e-btn-cam-stop',T.btn_cam_stop2);
+  // Console
+  setText('ptitle-console',T.panel_console_title);
+  // Settings modal
+  setText('modal-title-settings',T.settings_title);
+  setText('modal-sec-connection',T.settings_connection);
+  setText('modal-sec-poll',T.settings_poll);
+  setText('modal-sec-version',T.settings_version);
+  setText('btn-save-settings',T.settings_save);
+  setText('lbl-printer-ip',T.settings_printer_ip);
+  setText('lbl-mqtt-port',T.settings_mqtt_port);
+  setText('lbl-username',T.settings_username);
+  setText('lbl-password',T.settings_password);
+  setText('lbl-device-id',T.settings_device_id);
+  setText('lbl-mode-id',T.settings_mode_id);
+  setText('lbl-update-check',T.update_check);
+  setText('lbl-update-apply',T.update_apply);
 }
 function setText(id,txt){var el=document.getElementById(id);if(el)el.textContent=txt;}
 (function(){
@@ -1232,38 +1222,33 @@ function applyState(){
   // header
   var b=document.getElementById('h-badge');
   b.className='hbadge '+s.print_state;
-  document.getElementById('h-state').textContent=s.print_state.charAt(0).toUpperCase()+s.print_state.slice(1);
+  document.getElementById('h-state').textContent=T['kobra_'+s.kobra_state]||s.kobra_state||T.header_status_standby;
   document.getElementById('h-pname').textContent=s.printer_name;
 
   // temps
-  ['d-nt','p-nt','t-nt'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.nozzle_temp.toFixed(1)});
-  ['d-nt-t','p-nt-t','t-nt-t'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.nozzle_target.toFixed(0)});
-  ['d-bt','p-bt','t-bt'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.bed_temp.toFixed(1)});
-  ['d-bt-t','p-bt-t','t-bt-t'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.bed_target.toFixed(0)});
+  var nt=document.getElementById('d-nt');if(nt)nt.textContent=s.nozzle_temp.toFixed(1);
+  var ntt=document.getElementById('d-nt-t');if(ntt)ntt.textContent=s.nozzle_target.toFixed(0);
+  var bt=document.getElementById('d-bt');if(bt)bt.textContent=s.bed_temp.toFixed(1);
+  var btt=document.getElementById('d-bt-t');if(btt)btt.textContent=s.bed_target.toFixed(0);
 
-  // SVG arcs (0..100.5 = full, offset=100.5 means empty)
-  var narc=clamp(s.nozzle_temp/300,0,1);
-  var barc=clamp(s.bed_temp/120,0,1);
-  var da=document.getElementById('d-narc');if(da)da.setAttribute('stroke-dashoffset',(100.5*(1-narc)).toFixed(1));
-  var db=document.getElementById('d-barc');if(db)db.setAttribute('stroke-dashoffset',(100.5*(1-barc)).toFixed(1));
-
-  // temp bars (temps panel)
-  var nb=document.getElementById('t-ntbar');if(nb)nb.style.width=clamp(s.nozzle_temp/300*100,0,100)+'%';
-  var bb=document.getElementById('t-btbar');if(bb)bb.style.width=clamp(s.bed_temp/120*100,0,100)+'%';
+  // temp bars (dashboard)
+  var nb=document.getElementById('d-ntbar');if(nb)nb.style.width=clamp(s.nozzle_temp/300*100,0,100)+'%';
+  var bb=document.getElementById('d-btbar');if(bb)bb.style.width=clamp(s.bed_temp/120*100,0,100)+'%';
 
   // progress
   var pct=Math.round(s.progress*100);
-  ['d-pct','p-pct'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=pct});
-  ['d-pbar','p-pbar'].forEach(id=>{var el=document.getElementById(id);if(el)el.style.width=pct+'%'});
+  var dpct=document.getElementById('d-pct');if(dpct)dpct.textContent=pct;
+  var dpbar=document.getElementById('d-pbar');if(dpbar)dpbar.style.width=pct+'%';
 
   var layers=s.curr_layer&&s.total_layers?'L '+s.curr_layer+' / '+s.total_layers:'–';
-  ['d-layers','p-layers'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=layers});
+  var dlayers=document.getElementById('d-layers');if(dlayers)dlayers.textContent=layers;
 
   var elapsed=fmtTime(s.print_duration);
-  ['d-elapsed','p-elapsed'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=elapsed});
+  var delapsed=document.getElementById('d-elapsed');if(delapsed)delapsed.textContent=elapsed;
 
   var fn=s.filename||'–';
-  ['d-fname','p-fname'].forEach(id=>{var el=document.getElementById(id);if(el){el.textContent=fn;el.title=fn}});
+  var dfname=document.getElementById('d-fname');if(dfname){dfname.textContent=fn;dfname.title=fn};
+  var pfname=document.getElementById('p-fname');if(pfname){pfname.textContent=fn;pfname.title=fn};
   var cfo=document.getElementById('cam-fname');if(cfo)cfo.textContent=fn!=='–'?fn:'';
 
   // thumbnail
@@ -1280,13 +1265,8 @@ function applyState(){
 
   // light/fan sync
   document.getElementById('d-light-toggle').checked=s.light_on;
-  document.getElementById('e-light-toggle').checked=s.light_on;
-  ['d-fan','e-fan'].forEach(id=>{var el=document.getElementById(id);if(el)el.value=s.fan_speed});
-  ['d-fan-val','e-fan-val'].forEach(id=>{var el=document.getElementById(id);if(el)el.textContent=s.fan_speed});
-  document.getElementById('e-fan-val').textContent=s.fan_speed;
-
-  // camera url
-  if(s.camera_url){document.getElementById('e-cam-url').textContent=s.camera_url}
+  var dfan=document.getElementById('d-fan');if(dfan)dfan.value=s.fan_speed;
+  var dfanval=document.getElementById('d-fan-val');if(dfanval)dfanval.textContent=s.fan_speed;
 
   // AMS
   if(s.ams_slots&&s.ams_slots.length){
@@ -1322,8 +1302,7 @@ function updateHistory(){
   tempHistory.b.push(S.bed_temp);
   if(tempHistory.n.length>60)tempHistory.n.shift();
   if(tempHistory.b.length>60)tempHistory.b.shift();
-  drawChart('p-chart',tempHistory,[{data:tempHistory.n,color:'#00c8ff',max:300},{data:tempHistory.b,color:'#ff6b35',max:120}]);
-  drawChart('t-chart',tempHistory,[{data:tempHistory.n,color:'#00c8ff',max:300},{data:tempHistory.b,color:'#ff6b35',max:120}]);
+  drawChart('d-chart',tempHistory,[{data:tempHistory.n,color:'#00c8ff',max:300},{data:tempHistory.b,color:'#ff6b35',max:120}]);
 }
 function drawChart(id,_,series){
   var canvas=document.getElementById(id);if(!canvas)return;
@@ -1345,6 +1324,94 @@ function drawChart(id,_,series){
   });
 }
 
+// ── Settings Modal ──
+var _updateTag='';
+var _updateUrl='';
+function openSettings(){
+  fetch('/api/settings').then(function(r){return r.json()}).then(function(d){
+    document.getElementById('s-printer-ip').value=d.printer_ip||'';
+    document.getElementById('s-mqtt-port').value=d.mqtt_port||9883;
+    document.getElementById('s-username').value=d.username||'';
+    document.getElementById('s-password').value=d.password||'';
+    document.getElementById('s-device-id').value=d.device_id||'';
+    document.getElementById('s-mode-id').value=d.mode_id||'';
+  });
+  var v=localStorage.getItem('pollInterval')||'2000';
+  document.querySelectorAll('.poll-btn').forEach(function(b){b.classList.remove('active')});
+  var pb=document.getElementById('poll-'+Math.round(parseInt(v)/1000));
+  if(pb)pb.classList.add('active');
+  document.getElementById('s-version-label').textContent='v'+('__VERSION__'||'?');
+  document.getElementById('update-status').textContent='';
+  document.getElementById('btn-update-apply').style.display='none';
+  _updateTag='';_updateUrl='';
+  document.getElementById('settings-modal').classList.add('open');
+}
+function closeSettings(){
+  document.getElementById('settings-modal').classList.remove('open');
+}
+function setPoll(ms){
+  document.querySelectorAll('.poll-btn').forEach(function(b){b.classList.remove('active')});
+  var id='poll-'+Math.round(ms/1000);
+  var pb=document.getElementById(id);if(pb)pb.classList.add('active');
+  localStorage.setItem('pollInterval',ms);
+  clearInterval(pollTimer);
+  pollTimer=setInterval(poll,ms);
+}
+function saveSettings(){
+  var btn=document.getElementById('btn-save-settings');
+  btn.disabled=true;btn.textContent='…';
+  post('/api/settings',{
+    printer_ip: document.getElementById('s-printer-ip').value,
+    mqtt_port:  parseInt(document.getElementById('s-mqtt-port').value)||9883,
+    username:   document.getElementById('s-username').value,
+    password:   document.getElementById('s-password').value,
+    device_id:  document.getElementById('s-device-id').value,
+    mode_id:    document.getElementById('s-mode-id').value,
+  }).then(function(){
+    btn.textContent=T.update_restarting;
+    setTimeout(function(){
+      btn.disabled=false;
+      setText('btn-save-settings',T.settings_save);
+      closeSettings();
+      poll();
+    },4000);
+  }).catch(function(e){
+    btn.disabled=false;setText('btn-save-settings',T.settings_save);
+    clog('Settings-Fehler: '+e,'msg-err');
+  });
+}
+function checkUpdate(){
+  var sb=document.getElementById('update-status');
+  sb.textContent=T.update_checking;
+  document.getElementById('btn-update-apply').style.display='none';
+  _updateTag='';_updateUrl='';
+  fetch('/api/update/check').then(function(r){return r.json()}).then(function(d){
+    if(d.error){sb.textContent=T.update_error+': '+d.error;return;}
+    if(d.update_available){
+      sb.textContent='v'+d.latest+' '+T.update_available;
+      sb.style.color='var(--ok)';
+      _updateTag=d.tag;_updateUrl=d.download_url;
+      document.getElementById('btn-update-apply').style.display='inline-block';
+    } else {
+      sb.textContent=T.update_none;
+      sb.style.color='var(--txt2)';
+    }
+  }).catch(function(e){sb.textContent=T.update_error+': '+e;});
+}
+function applyUpdate(){
+  if(!_updateUrl)return;
+  var sb=document.getElementById('update-status');
+  var btn=document.getElementById('btn-update-apply');
+  btn.disabled=true;sb.textContent=T.update_applying;
+  post('/api/update/apply',{download_url:_updateUrl,tag:_updateTag}).then(function(){
+    sb.textContent=T.update_restarting;
+    closeSettings();
+    setTimeout(function(){poll();},5000);
+  }).catch(function(e){
+    btn.disabled=false;sb.textContent=T.update_error+': '+e;
+  });
+}
+
 // ── Poll ──
 async function poll(){
   try{
@@ -1356,7 +1423,11 @@ async function poll(){
     updateHistory();
   }catch(e){clog('Poll-Fehler: '+e,'msg-err')}
 }
-poll();setInterval(poll,2000);
+var pollTimer;
+(function(){
+  var ms=parseInt(localStorage.getItem('pollInterval')||'2000');
+  poll();pollTimer=setInterval(poll,ms);
+})();
 
 // ── Print actions ──
 function printAction(a){
@@ -1407,28 +1478,10 @@ function setBed(){
     .then(function(){clog('Bett → '+v+'°C','msg-ok')})
     .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
 }
-function setNozzle2(){
-  var v=parseFloat(document.getElementById('t-nozzle-inp').value||0);
-  post('/api/temperature',{nozzle:v,bed:S.bed_target})
-    .then(function(){clog('Nozzle → '+v+'°C','msg-ok')})
-    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
-}
-function setBed2(){
-  var v=parseFloat(document.getElementById('t-bed-inp').value||0);
-  post('/api/temperature',{nozzle:S.nozzle_target,bed:v})
-    .then(function(){clog('Bett → '+v+'°C','msg-ok')})
-    .catch(function(e){clog('Temp-Fehler: '+e,'msg-err')});
-}
 
 // ── Light ──
 function setLight(){
   var on=document.getElementById('d-light-toggle').checked;
-  post('/api/light',{on:on,brightness:80})
-    .then(function(){clog('Licht '+(on?'an, '+br+'%':'aus'),'msg-ok')})
-    .catch(function(e){clog('Licht-Fehler: '+e,'msg-err')});
-}
-function setLight2(){
-  var on=document.getElementById('e-light-toggle').checked;
   post('/api/light',{on:on,brightness:80})
     .then(function(){clog('Licht '+(on?'an, '+br+'%':'aus'),'msg-ok')})
     .catch(function(e){clog('Licht-Fehler: '+e,'msg-err')});
@@ -1442,15 +1495,9 @@ function setFan(){
     .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
     .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
 }
-function setFan2(){
-  var v=parseInt(document.getElementById('e-fan').value);
-  post('/api/fan',{speed:v})
-    .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
-    .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
-}
 function quickFan(v){
-  document.getElementById('e-fan').value=v;
-  document.getElementById('e-fan-val').textContent=v;
+  document.getElementById('d-fan').value=v;
+  document.getElementById('d-fan-val').textContent=v;
   post('/api/fan',{speed:v})
     .then(function(){clog('Lüfter → '+v+'%','msg-ok')})
     .catch(function(e){clog('Lüfter-Fehler: '+e,'msg-err')});
@@ -1473,21 +1520,23 @@ function camStart(){
   img.style.display='none';
   sp.style.display='block';
   post('/api/camera/start',{}).then(function(){
-    return new Promise(function(res){setTimeout(res,800)});
-  }).then(function(){
-    img.onload=function(){
-      sp.style.display='none';
-      img.style.display='block';
-    };
     img.onerror=function(){
       sp.style.display='none';
+      img.style.display='none';
       ph.style.display='flex';
+      camOn=false;
+      document.getElementById('cam-toggle-btn').textContent=T.btn_cam_start||'▶ Kamera';
       clog((T.log_error||'Fehler:')+' Stream nicht verfügbar','msg-err');
     };
     img.src='/api/camera/stream?t='+Date.now();
     camOn=true;
     document.getElementById('cam-toggle-btn').textContent=T.btn_cam_stop||'◼ Kamera';
     clog((T.log_cam_start||'Kamera gestartet'),'msg-ok');
+    // MJPEG liefert kein onload – Spinner nach kurzem Timeout ausblenden
+    setTimeout(function(){
+      sp.style.display='none';
+      img.style.display='block';
+    },1200);
   }).catch(function(e){
     sp.style.display='none';
     ph.style.display='flex';
@@ -1513,6 +1562,8 @@ function toggleCam(){if(camOn)camStop();else camStart()}
 </footer>
 </body>
 </html>"""
+        version = self._read_version()
+        html = html.replace("'__VERSION__'", f"'{version}'")
         return web.Response(text=html, content_type="text/html",
                             headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
@@ -1641,13 +1692,26 @@ function toggleCam(){if(camOn)camStop();else camStart()}
         })
         await resp.prepare(request)
 
+        is_rtsp = url.lower().startswith("rtsp://")
+        ffmpeg_input_args = [
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+        ]
+        if is_rtsp:
+            ffmpeg_input_args += ["-probesize", "32", "-analyzeduration", "0", "-rtsp_transport", "tcp"]
+        else:
+            # HTTP-FLV/HLS: braucht mehr Probe-Puffer für Container-Erkennung
+            ffmpeg_input_args += ["-probesize", "1000000", "-analyzeduration", "1000000"]
+
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "quiet",
+            *ffmpeg_input_args,
             "-i", url,
-            "-vf", "fps=10,scale=640:-1",
+            "-vf", "fps=15,scale=640:-1",
             "-f", "image2pipe",
             "-vcodec", "mjpeg",
-            "-q:v", "5",
+            "-q:v", "3",
+            "-flush_packets", "1",
             "pipe:1",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1709,6 +1773,7 @@ function toggleCam(){if(camOn)camStop();else camStart()}
             "printer_name":     s["printer_name"],
             "firmware_version": s["firmware_version"],
             "print_state":      s["print_state"],
+            "kobra_state":      s["kobra_state"],
             "nozzle_temp":      s["nozzle_temp"],
             "nozzle_target":    s["nozzle_target"],
             "bed_temp":         s["bed_temp"],
@@ -1776,6 +1841,160 @@ function toggleCam(){if(camOn)camStop();else camStart()}
                 if slots:
                     self._ams_slots = slots
         return self._ams_slots
+
+    # ─── Settings ────────────────────────────────────────────────────────────
+
+    def _find_env_path(self) -> pathlib.Path:
+        """Gibt den Pfad zur .env-Datei zurück (neben Script oder im Parent)."""
+        script_dir = pathlib.Path(__file__).parent
+        for base in (script_dir, script_dir.parent):
+            p = base / ".env"
+            if p.is_file():
+                return p
+        return script_dir.parent / ".env"
+
+    async def handle_api_settings_get(self, request):
+        return web.json_response({
+            "printer_ip":  self._args.printer_ip,
+            "mqtt_port":   self._args.mqtt_port,
+            "username":    self._args.username,
+            "password":    self._args.password,
+            "mode_id":     self._args.mode_id,
+            "device_id":   self._args.device_id,
+        })
+
+    async def handle_api_settings_post(self, request):
+        data = await request.json()
+        env_path = self._find_env_path()
+        # Bestehende .env einlesen um Kommentare/Extra-Keys zu erhalten
+        existing: "dict[str, str]" = {}
+        lines: "list[str]" = []
+        if env_path.is_file():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k, _, v = stripped.partition("=")
+                    existing[k.strip()] = v.strip()
+                lines.append(line)
+        # Werte aktualisieren
+        mapping = {
+            "PRINTER_IP":    str(data.get("printer_ip",  existing.get("PRINTER_IP",  ""))),
+            "MQTT_PORT":     str(data.get("mqtt_port",   existing.get("MQTT_PORT",   "9883"))),
+            "MQTT_USERNAME": str(data.get("username",    existing.get("MQTT_USERNAME",""))),
+            "MQTT_PASSWORD": str(data.get("password",    existing.get("MQTT_PASSWORD",""))),
+            "MODE_ID":       str(data.get("mode_id",     existing.get("MODE_ID",      ""))),
+            "DEVICE_ID":     str(data.get("device_id",   existing.get("DEVICE_ID",    ""))),
+        }
+        # Zeilen ersetzen oder neue Keys anhängen
+        written: "set[str]" = set()
+        new_lines: "list[str]" = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k = stripped.partition("=")[0].strip()
+                if k in mapping:
+                    new_lines.append(f"{k}={mapping[k]}")
+                    written.add(k)
+                    continue
+            new_lines.append(line)
+        for k, v in mapping.items():
+            if k not in written:
+                new_lines.append(f"{k}={v}")
+        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        log.info(f"Settings gespeichert in {env_path}")
+        # Response senden, dann Neustart
+        response = web.json_response({"status": "restarting"})
+        asyncio.get_event_loop().call_later(0.3, self._restart_bridge)
+        return response
+
+    def _restart_bridge(self):
+        log.info("Bridge wird neu gestartet …")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # ─── Update ──────────────────────────────────────────────────────────────
+
+    GITEA_RELEASE_API = "https://gitea.it-drui.de/api/v1/repos/viewit/KX-Bridge-Release/releases?limit=1&pre-release=true"
+    GITEA_RAW_BASE    = "https://gitea.it-drui.de/viewit/KX-Bridge-Release/raw/tag"
+
+    def _read_version(self) -> str:
+        for base in (pathlib.Path(__file__).parent, pathlib.Path(__file__).parent.parent):
+            p = base / "VERSION"
+            if p.is_file():
+                return p.read_text(encoding="utf-8").strip()
+        return "unknown"
+
+    def _write_version(self, version: str):
+        for base in (pathlib.Path(__file__).parent, pathlib.Path(__file__).parent.parent):
+            p = base / "VERSION"
+            if p.is_file():
+                p.write_text(version + "\n", encoding="utf-8")
+                return
+        # Fallback: neben dem Script
+        (pathlib.Path(__file__).parent.parent / "VERSION").write_text(version + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _parse_version(v: str) -> "tuple[int, ...]":
+        """'v0.9.1-beta1' → (0, 9, 1)  –  nur numerische Teile vor dem ersten '-'"""
+        v = v.lstrip("v").split("-")[0]
+        parts = re.split(r"[.\s]+", v)
+        result = []
+        for p in parts:
+            try:
+                result.append(int(p))
+            except ValueError:
+                break
+        return tuple(result) or (0,)
+
+    async def handle_api_update_check(self, request):
+        current = self._read_version()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.GITEA_RELEASE_API, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        return web.json_response({"error": f"Gitea HTTP {resp.status}"}, status=502)
+                    releases = await resp.json(content_type=None)
+            if not releases:
+                return web.json_response({"error": "Keine Releases gefunden"}, status=404)
+            data = releases[0]
+            tag = data.get("tag_name", "")
+            latest = tag.lstrip("v")
+            update_available = self._parse_version(tag) > self._parse_version(current)
+            download_url = f"{self.GITEA_RAW_BASE}/{tag}/kobrax_moonraker_bridge.py"
+            return web.json_response({
+                "current":          current,
+                "latest":           latest,
+                "update_available": update_available,
+                "tag":              tag,
+                "download_url":     download_url,
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=502)
+
+    async def handle_api_update_apply(self, request):
+        data = await request.json()
+        download_url = data.get("download_url", "")
+        new_tag      = data.get("tag", "")
+        if not download_url:
+            return web.json_response({"error": "download_url fehlt"}, status=400)
+        script_path = pathlib.Path(__file__).resolve()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(download_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        return web.json_response({"error": f"Download HTTP {resp.status}"}, status=502)
+                    content = await resp.read()
+            # Atomisch ersetzen
+            tmp = script_path.with_suffix(".py.new")
+            tmp.write_bytes(content)
+            os.replace(tmp, script_path)
+            if new_tag:
+                self._write_version(new_tag.lstrip("v"))
+            log.info(f"Update auf {new_tag} installiert, starte neu …")
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=502)
+        response = web.json_response({"status": "updating"})
+        asyncio.get_event_loop().call_later(0.3, self._restart_bridge)
+        return response
 
     async def handle_catchall(self, request):
         body = await request.read()
@@ -1922,8 +2141,41 @@ function toggleCam(){if(camOn)camStop();else camStart()}
     # Poll loop (sync, runs in executor)
     # -------------------------------------------------------------------------
 
+    def _printer_reachable(self) -> bool:
+        """TCP-Probe auf den MQTT-Port – kein ICMP nötig, kein root erforderlich."""
+        import socket as _socket
+        try:
+            with _socket.create_connection(
+                (self._args.printer_ip, self._args.mqtt_port), timeout=2.0
+            ):
+                return True
+        except OSError:
+            return False
+
     def _poll_loop(self, stop_event: threading.Event):
+        _offline = False          # True = Drucker zuletzt nicht erreichbar
+        _probe_interval = 10.0   # Sekunden zwischen TCP-Probes im Offline-Modus
+
         while not stop_event.is_set():
+            # ── Offline-Modus: warten bis Drucker wieder erreichbar ──────────
+            if _offline:
+                if self._printer_reachable():
+                    log.info("Drucker erreichbar – stelle MQTT-Verbindung her …")
+                    try:
+                        self.client.connect()
+                        _offline = False
+                        self._state["print_state"] = "standby"
+                        self._state["kobra_state"] = "free"
+                        log.info("MQTT-Verbindung wiederhergestellt")
+                    except Exception as e:
+                        log.warning(f"Verbindungsaufbau fehlgeschlagen: {e}")
+                        stop_event.wait(_probe_interval)
+                        continue
+                else:
+                    stop_event.wait(_probe_interval)
+                    continue
+
+            # ── Online-Modus: normaler Poll ──────────────────────────────────
             try:
                 info = self.client.query_info()
                 if info:
@@ -1942,6 +2194,16 @@ function toggleCam(){if(camOn)camStop();else camStart()}
                         self._ams_slots = slots
             except Exception as e:
                 log.warning(f"Poll-Fehler: {e}")
+                # Prüfen ob Drucker wirklich weg ist
+                if not self._printer_reachable():
+                    log.info("Drucker nicht erreichbar – wechsle in Offline-Modus")
+                    self._state["print_state"] = "error"
+                    self._state["kobra_state"] = "offline"
+                    try:
+                        self.client.disconnect()
+                    except Exception:
+                        pass
+                    _offline = True
             stop_event.wait(3.0)
 
 
@@ -1987,6 +2249,10 @@ def build_app(bridge: KobraXBridge) -> web.Application:
     r.add_post("/api/camera/start",        bridge.handle_api_camera_start)
     r.add_post("/api/camera/stop",         bridge.handle_api_camera_stop)
     r.add_get("/api/state",                bridge.handle_api_state)
+    r.add_get("/api/settings",             bridge.handle_api_settings_get)
+    r.add_post("/api/settings",            bridge.handle_api_settings_post)
+    r.add_get("/api/update/check",         bridge.handle_api_update_check)
+    r.add_post("/api/update/apply",        bridge.handle_api_update_apply)
     r.add_get("/serve/{filename}",         bridge.handle_serve_file)
 
     # Root + favicon (OrcaSlicer öffnet / in eingebettetem Browser)
@@ -2018,7 +2284,7 @@ async def run_bridge(args):
     await loop.run_in_executor(None, client.connect)
     log.info("MQTT verbunden")
 
-    bridge  = KobraXBridge(client)
+    bridge  = KobraXBridge(client, args=args)
     app     = build_app(bridge)
 
     stop_event = threading.Event()
