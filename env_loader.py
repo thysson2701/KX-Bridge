@@ -3,12 +3,14 @@ env_loader.py – lädt Verbindungsparameter aus .env (Repo-Root oder Arbeitsver
 Umgebungsvariablen haben Vorrang vor .env-Werten.
 """
 import os
+import sys
 import pathlib
+
+_BASE = pathlib.Path(sys.executable).parent if getattr(sys, "frozen", False) else pathlib.Path(__file__).parent
 
 
 def _find_env_file() -> pathlib.Path | None:
-    # Suche .env im selben Verzeichnis, dann im Parent (Repo-Root)
-    for base in (pathlib.Path(__file__).parent, pathlib.Path(__file__).parent.parent):
+    for base in (_BASE, _BASE.parent):
         p = base / ".env"
         if p.is_file():
             return p

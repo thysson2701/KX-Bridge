@@ -24,8 +24,9 @@ import tempfile
 import time
 import threading
 
-# kobrax_client aus dem selben Verzeichnis importieren
-sys.path.insert(0, os.path.dirname(__file__))
+# Bei PyInstaller-Binary liegt alles neben sys.executable, sonst neben __file__
+_BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _BASE)
 from kobrax_client import KobraXClient
 
 try:
@@ -1960,7 +1961,7 @@ function toggleCam(){if(camOn)camStop();else camStart()}
 
     def _find_env_path(self) -> pathlib.Path:
         """Gibt den Pfad zur .env-Datei zurück (neben Script oder im Parent)."""
-        script_dir = pathlib.Path(__file__).parent
+        script_dir = pathlib.Path(_BASE)
         for base in (script_dir, script_dir.parent):
             p = base / ".env"
             if p.is_file():
@@ -2031,20 +2032,19 @@ function toggleCam(){if(camOn)camStop();else camStart()}
     GITEA_RAW_BASE    = "https://gitea.it-drui.de/viewit/KX-Bridge-Release/raw/tag"
 
     def _read_version(self) -> str:
-        for base in (pathlib.Path(__file__).parent, pathlib.Path(__file__).parent.parent):
+        for base in (pathlib.Path(_BASE), pathlib.Path(_BASE).parent):
             p = base / "VERSION"
             if p.is_file():
                 return p.read_text(encoding="utf-8").strip()
         return "unknown"
 
     def _write_version(self, version: str):
-        for base in (pathlib.Path(__file__).parent, pathlib.Path(__file__).parent.parent):
+        for base in (pathlib.Path(_BASE), pathlib.Path(_BASE).parent):
             p = base / "VERSION"
             if p.is_file():
                 p.write_text(version + "\n", encoding="utf-8")
                 return
-        # Fallback: neben dem Script
-        (pathlib.Path(__file__).parent.parent / "VERSION").write_text(version + "\n", encoding="utf-8")
+        (pathlib.Path(_BASE) / "VERSION").write_text(version + "\n", encoding="utf-8")
 
     @staticmethod
     def _parse_version(v: str) -> "tuple[int, ...]":
@@ -2090,7 +2090,7 @@ function toggleCam(){if(camOn)camStop();else camStart()}
         new_tag      = data.get("tag", "")
         if not download_url:
             return web.json_response({"error": "download_url fehlt"}, status=400)
-        script_path = pathlib.Path(__file__).resolve()
+        script_path = pathlib.Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(download_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:

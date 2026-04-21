@@ -20,6 +20,7 @@ import json
 import os
 import socket
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -27,7 +28,7 @@ from datetime import datetime
 
 import env_loader
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 CERT_FILE = os.path.join(_SCRIPT_DIR, "anycubic_slicer.crt")
 KEY_FILE  = os.path.join(_SCRIPT_DIR, "anycubic_slicer.key")
 
