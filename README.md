@@ -2,7 +2,9 @@
 
 Verbindet den Anycubic Kobra X mit OrcaSlicer – ohne Klipper, ohne Raspberry Pi.
 
-KX-Bridge läuft auf deinem PC oder NAS und stellt eine Schnittstelle bereit, über die OrcaSlicer den Drucker direkt steuern kann: Druckstart, Temperatur, Fortschritt, AMS-Farbwechsel.
+KX-Bridge läuft auf deinem PC oder NAS und stellt eine Moonraker-kompatible Schnittstelle bereit, über die OrcaSlicer den Drucker direkt steuern kann: Druckstart, Temperatur, Fortschritt, Pause/Fortsetzen/Abbrechen, AMS-Farbwechsel, Druckgeschwindigkeit und mehr.
+
+**Version:** 0.9.1-beta4
 
 ---
 
@@ -11,12 +13,28 @@ KX-Bridge läuft auf deinem PC oder NAS und stellt eine Schnittstelle bereit, ü
 | Datei | Beschreibung |
 |-------|-------------|
 | `kobrax_moonraker_bridge.py` | Bridge-Hauptprogramm |
+| `kx-bridge` | Vorkompilierte Linux-Binary |
 | `extract_credentials.exe` | Zugangsdaten aus AnycubicSlicerNext auslesen (Windows) |
 | `extract_credentials` | Zugangsdaten aus AnycubicSlicerNext auslesen (Linux) |
 | `kobra_x_orcaslicer_preset.zip` | OrcaSlicer-Druckerprofil für den Kobra X |
 | `bridge.sh` | Service-Manager für Linux |
 | `Dockerfile` / `docker-compose.yml` | Docker-Deployment |
 | `.env.example` | Konfigurationsvorlage |
+
+---
+
+## Was wird unterstützt?
+
+- Druckerstatus (Temperatur, Fortschritt, Zustand)
+- Dateiübertragung und Druckstart
+- Drucksteuerung: Pause, Fortsetzen, Abbrechen
+- Temperaturregelung während des laufenden Drucks
+- Druckgeschwindigkeit (Leise / Normal / Sport)
+- AMS-Farbwechsel (Einziehen / Ausziehen)
+- Licht- und Lüftersteuerung
+- Web-UI mit Dashboard, Temperaturkarten, Achsensteuerung und Kameraansicht
+- Einstellungen und Self-Update direkt im Browser (⚙-Menü)
+- OrcaSlicer-Verbindung (Moonraker-Protokoll)
 
 ---
 
@@ -35,18 +53,16 @@ KX-Bridge läuft auf deinem PC oder NAS und stellt eine Schnittstelle bereit, ü
 
 Die Bridge benötigt druckerspezifische MQTT-Zugangsdaten.
 
-> Wichtig: Der Drucker muss sich im LAN-Modus befinden. Nur wenn der Drucker direkt über LAN (nicht ausschließlich über die Anycubic-Cloud) erreichbar ist, können die Zugangsdaten ermittelt und die Bridge genutzt werden.
+> **Wichtig:** Der Drucker muss sich im LAN-Modus befinden. Nur wenn der Drucker direkt über LAN (nicht ausschließlich über die Anycubic-Cloud) erreichbar ist, können die Zugangsdaten ermittelt und die Bridge genutzt werden.
 
-Die Zugangsdaten werden mit `extract_credentials` aus dem laufenden AnycubicSlicerNext ausgelesen.
+AnycubicSlicerNext starten und mit dem Drucker verbinden (bis der Drucker-Status angezeigt wird), dann:
 
-Vorbereitung: AnycubicSlicerNext starten und mit dem Drucker verbinden (bis der Drucker-Status angezeigt wird).
-
-Windows:
+**Windows:**
 ```
 extract_credentials.exe --write-env
 ```
 
-Linux:
+**Linux:**
 ```bash
 chmod +x extract_credentials
 ./extract_credentials --write-env
@@ -69,13 +85,13 @@ cp .env.example .env
 
 ### Schritt 3: Bridge starten
 
-Option A – Docker (empfohlen):
+**Option A – Docker (empfohlen):**
 ```bash
 docker compose up -d
 ```
 Läuft im Hintergrund, startet automatisch nach Systemneustart.
 
-Option B – Linux Binary:
+**Option B – Linux Binary:**
 ```bash
 chmod +x kx-bridge
 ./kx-bridge
@@ -83,7 +99,7 @@ chmod +x kx-bridge
 ./bridge.sh start
 ```
 
-Option C – Python direkt:
+**Option C – Python direkt:**
 ```bash
 pip install aiohttp
 python kobrax_moonraker_bridge.py
@@ -93,7 +109,7 @@ python kobrax_moonraker_bridge.py
 
 ### Schritt 4: OrcaSlicer-Profil installieren
 
-1. `kobra_x_orcaslicer_preset.zip` in OrcaSlicer importieren:
+1. `kobra_x_orcaslicer_preset.zip` in OrcaSlicer importieren:  
    Datei → Konfigurationen importieren → ZIP auswählen
 2. Anycubic Kobra X als Drucker auswählen
 
@@ -102,9 +118,30 @@ python kobrax_moonraker_bridge.py
 ### Schritt 5: OrcaSlicer verbinden
 
 1. Drucker-Einstellungen öffnen
-2. Verbindungstyp: Moonraker
+2. Verbindungstyp: **Moonraker**
 3. Adresse: `http://IP-DES-BRIDGE-PC:7125` eintragen
-4. Auf "Test" klicken – bei erfolgreicher Verbindung erscheint eine Bestätigungsmeldung
+4. Auf „Test" klicken – bei erfolgreicher Verbindung erscheint eine Bestätigungsmeldung
+
+---
+
+## Web-UI
+
+Die Bridge stellt unter `http://BRIDGE-IP:7125` eine Web-Oberfläche bereit:
+
+| Bereich | Funktion |
+|---------|----------|
+| Dashboard | Druckerstatus, Fortschritt, Temperaturübersicht |
+| Temperaturen | Nozzle und Bett direkt setzen |
+| Achsen | X/Y/Z-Bewegung, Motorfreigabe |
+| Druckgeschwindigkeit | Leise / Normal / Sport |
+| Lüfter / Licht | Lüfterdrehzahl und Drucklicht |
+| AMS | Filament einziehen / ausziehen |
+| Kamera | Live-Vorschau (falls vom Drucker unterstützt) |
+| ⚙ Einstellungen | MQTT-Zugangsdaten, Poll-Intervall, Self-Update |
+
+### Self-Update
+
+Über das ⚙-Menü in der Web-UI kann die Bridge auf neue Versionen prüfen und sich selbst aktualisieren — ohne Neuinstallation. Nach dem Download startet sie automatisch neu.
 
 ---
 
@@ -133,23 +170,26 @@ docker compose pull && docker compose up -d  # Update
 
 ## Fehlerbehebung
 
-Port 7125 belegt:
+**Port 7125 belegt:**
 ```bash
 ./bridge.sh stop
 ./bridge.sh start
 ```
 
-Verbindungstest in OrcaSlicer schlägt fehl:
+**Verbindungstest in OrcaSlicer schlägt fehl:**
 - Firewall prüfen: Port 7125 muss erreichbar sein
 - Bridge-Log prüfen: `./bridge.sh log` oder `docker compose logs`
 - Drucker-IP in `.env` korrekt?
 
-Zugangsdaten werden abgelehnt:
+**Zugangsdaten werden abgelehnt:**
 - AnycubicSlicerNext starten, mit Drucker verbinden
 - `extract_credentials --verbose` ausführen und alle Kandidaten prüfen
 - Richtigen Wert manuell in `.env` eintragen, Bridge neu starten
 
-Docker: Permission denied:
+**Temperaturänderungen werden ignoriert:**
+- Während eines laufenden Drucks werden Temperaturänderungen über einen separaten Kanal gesendet — das ist normal und wird von der Bridge automatisch erkannt.
+
+**Docker: Permission denied:**
 ```bash
 sudo usermod -aG docker $USER
 # Neu einloggen, dann erneut versuchen
@@ -172,7 +212,9 @@ sudo usermod -aG docker $USER
 
 ## Sicherheitshinweise
 
-- Alle Zugangsdaten werden ausschließlich lokal verarbeitet
+- Die Bridge bindet standardmäßig auf `0.0.0.0:7125` — nur im lokalen Netzwerk nutzen
+- `.env` enthält Drucker-Credentials — nicht öffentlich teilen
+- Alle Zugangsdaten werden ausschließlich lokal verarbeitet — keine Übertragung an externe Server
 
 ---
 
@@ -180,6 +222,6 @@ sudo usermod -aG docker $USER
 
 Dieses Projekt dient der privaten Nutzung und der Herstellung von Interoperabilität zwischen dem Anycubic Kobra X und freier Software (OrcaSlicer).
 
-`extract_credentials` liest ausschließlich den Arbeitsspeicher des auf deinem eigenen PC laufenden AnycubicSlicerNext-Prozesses. Es werden keine Daten übertragen oder gespeichert, außer in die lokale `.env`-Datei. Das Tool funktioniert nur für den Prozess des Druckers, dem du selbst gehörst.
+`extract_credentials` liest ausschließlich den Arbeitsspeicher des auf deinem eigenen PC laufenden AnycubicSlicerNext-Prozesses. Es werden keine Daten übertragen oder gespeichert, außer in die lokale `.env`-Datei.
 
 Das Projekt steht in keiner Verbindung zu Anycubic und wird nicht kommerziell betrieben.
